@@ -1,20 +1,25 @@
 # app.py — Banking Support Chatbot with Admin Console (Streamlit)
-# Auto-seeds demo accounts:
+# Demo accounts (auto-created / auto-upgraded on first run):
 #   admin / admin123
 #   user  / user123
 #
-# Cloud-safe: uses ONLY Python stdlib for password hashing (no bcrypt)
-# Fixes included:
-# 1) TF-IDF "empty vocabulary" for small custom FAQ sets (dynamic min_df).
-# 2) Streamlit input reset bug (form clear_on_submit).
+# Deployment-safe:
+# - No bcrypt (uses Python stdlib PBKDF2 hashing)
+# - No datasets lib (loads Bitext parquet via pandas)
 #
-# Requirements.txt can stay simple:
+# Fixes included:
+# 1) TF-IDF "empty vocabulary" for tiny custom FAQ sets (dynamic min_df).
+# 2) Streamlit input reset bug (form clear_on_submit).
+# 3) Auto-upgrade old stored hashes to PBKDF2 so login works even if DB existed earlier.
+#
+# requirements.txt (repo root):
 # streamlit
 # openai
-# datasets
 # pandas
 # scikit-learn
 # pyarrow
+# huggingface-hub
+# fsspec
 
 import os
 import re
@@ -23,7 +28,6 @@ import base64
 import hashlib
 import pandas as pd
 import streamlit as st
-from datasets import load_dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -32,9 +36,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ----------------------------
 APP_NAME = "SACCO/BANK Support Bot"
 DB_PATH = "bankbot.db"
-BASE_DATASET_ID = "bitext/Bitext-retail-banking-llm-chatbot-training-dataset"
-TOPK = 3
 
+# HuggingFace parquet (Bitext retail banking)
+BASE_PARQUET_URL = (
+    "hf://datasets/bitext/Bitext-retail-banking-llm-chatbot-training-dataset/"
+    "bitext-retail-banking-llm-chatbot-training-dataset.parquet"
+)
+
+TOPK = 3
 SIM_THRESHOLD_CUSTOM = 0.40
 SIM_THRESHOLD_BASE = 0.35
 
@@ -51,7 +60,29 @@ def hash_password(password: str, salt: bytes = None) -> str:
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
     return base64.b64encode(salt + key).decode()
 
-def verify_password(password: str, stored: str) -> bool:
+def is_pbkdf2_hash(stored) -> bool:
+    """True if stored looks like our PBKDF2 base64 hash."""
+    if stored is None:
+        return False
+    if isinstance(stored, bytes):
+        try:
+            stored = stored.decode()
+        except Exception:
+            return False
+    if not isinstance(stored, str):
+        return False
+    try:
+        raw = base64.b64decode(stored.encode())
+        return len(raw) >= 48  # 16 salt + 32 key typical
+    except Exception:
+        return False
+
+def verify_password(password: str, stored) -> bool:
+    if not is_pbkdf2_hash(stored):
+        return False
+    if isinstance(stored, bytes):
+        stored = stored.decode()
+
     raw = base64.b64decode(stored.encode())
     salt, key = raw[:16], raw[16:]
     new_key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
@@ -132,14 +163,28 @@ hr{ border:none; border-top:1px solid rgba(255,255,255,0.08); }
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def seed_user_if_missing(c, username, password, role):
-    c.execute("SELECT username FROM users WHERE username=?", (username,))
-    if not c.fetchone():
-        pw_hash = hash_password(password)
+def seed_or_upgrade_user(c, username, password, role):
+    """
+    If user missing -> insert PBKDF2 hash.
+    If user exists but hash is old/invalid -> overwrite with PBKDF2 hash.
+    """
+    c.execute("SELECT pw_hash FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+
+    new_hash = hash_password(password)
+
+    if not row:
         c.execute(
             "INSERT INTO users(username,pw_hash,role) VALUES(?,?,?)",
-            (username, pw_hash, role)
+            (username, new_hash, role)
         )
+    else:
+        stored_hash = row[0]
+        if not is_pbkdf2_hash(stored_hash):
+            c.execute(
+                "UPDATE users SET pw_hash=?, role=? WHERE username=?",
+                (new_hash, role, username)
+            )
 
 def init_db():
     conn = get_conn()
@@ -176,8 +221,9 @@ def init_db():
     );
     """)
 
-    seed_user_if_missing(c, "admin", "admin123", "admin")
-    seed_user_if_missing(c, "user",  "user123",  "user")
+    # ✅ Auto-create / auto-upgrade BOTH accounts
+    seed_or_upgrade_user(c, "admin", "admin123", "admin")
+    seed_or_upgrade_user(c, "user",  "user123",  "user")
 
     conn.commit()
     conn.close()
@@ -241,14 +287,14 @@ def log_chat(username, user_message, bot_reply, source, score):
 
 
 # ----------------------------
-# DATASET LOADING
+# DATASET LOADING (no datasets lib)
 # ----------------------------
 @st.cache_resource
 def load_base_dataset():
-    ds = load_dataset(BASE_DATASET_ID)
-    df = ds["train"].to_pandas()
+    df = pd.read_parquet(BASE_PARQUET_URL)
 
     cols = {c.lower(): c for c in df.columns}
+
     def pick(*names):
         for n in names:
             if n in cols:
@@ -259,18 +305,18 @@ def load_base_dataset():
     acol = pick("response", "answer", "assistant", "output")
 
     if not qcol or not acol:
-        raise ValueError(
-            f"Could not detect question/answer columns in dataset. Found: {df.columns}"
-        )
+        raise ValueError(f"Could not detect question/answer columns. Found: {df.columns}")
 
     base_df = df[[qcol, acol]].rename(columns={qcol: "question", acol: "answer"})
     base_df["question"] = base_df["question"].astype(str)
     base_df["answer"] = base_df["answer"].astype(str)
     base_df.dropna(inplace=True)
     base_df.reset_index(drop=True, inplace=True)
+
     return base_df
 
 
+# ✅ dynamic min_df so tiny custom FAQ sets don't crash
 @st.cache_resource
 def build_vector_index(texts):
     texts = [t for t in texts if isinstance(t, str) and t.strip()]
@@ -365,18 +411,21 @@ def generate_reply(query, username):
     vec_b, X_b = build_vector_index(base_df["question"].tolist())
     custom_df = fetch_custom_faqs()
 
+    # 1) custom FAQs first
     custom_hit = answer_from_custom_first(query, custom_df)
     if custom_hit:
         ans, score, source = custom_hit
         log_chat(username, query, ans, source, score)
         return ans, source, score
 
+    # 2) base dataset similarity
     base_hit = answer_from_base(query, base_df, vec_b, X_b)
     if base_hit:
         ans, score, source = base_hit
         log_chat(username, query, ans, source, score)
         return ans, source, score
 
+    # 3) OpenAI fallback with top base snippets as context
     top_base = retrieve_best(query, base_df, vec_b, X_b, topk=TOPK)
     snippets = [f"Q: {r.question}\nA: {r.answer}" for r in top_base.itertuples()]
     ans, score, source = openai_fallback(query, snippets)
@@ -490,6 +539,7 @@ def admin_page():
     st.write("")
     tabs = st.tabs(["➕ Add FAQ", "🛠️ Manage FAQs", "📊 Chat Logs"])
 
+    # ADD FAQ
     with tabs[0]:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
         q = st.text_area("Customer Question (as they would ask it)")
@@ -506,6 +556,7 @@ def admin_page():
             else:
                 st.error("Question and Answer are required.")
 
+    # MANAGE FAQs
     with tabs[1]:
         df = fetch_custom_faqs()
         if df.empty:
@@ -536,6 +587,7 @@ def admin_page():
                     st.warning("FAQ deleted.")
                     st.rerun()
 
+    # LOGS
     with tabs[2]:
         conn = get_conn()
         logs = pd.read_sql_query(
