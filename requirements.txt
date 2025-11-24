@@ -1,0 +1,8 @@
+streamlit
+openai
+datasets
+pandas
+scikit-learn
+pyarrow
+huggingface-hub
+fsspec
