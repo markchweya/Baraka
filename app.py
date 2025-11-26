@@ -31,7 +31,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ----------------------------
 # CONFIG
 # ----------------------------
-APP_NAME = "AI SACCO Complaint & Support Bot"
+APP_NAME = "AI Bank Complaint & Support Bot"
 DB_PATH = "bankbot.db"
 
 BASE_PARQUET_URL = (
