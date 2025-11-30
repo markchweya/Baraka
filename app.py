@@ -174,7 +174,7 @@ def verify_password(password: str, stored) -> bool:
 
 
 # ----------------------------
-# STYLING (restyled chat: no huge empty space)
+# STYLING 
 # ----------------------------
 BANK_CSS = """
 <style>
@@ -212,7 +212,7 @@ BANK_CSS = """
 .badge-ok{ background:rgba(89,249,183,0.12); color:var(--ok); border-color:rgba(89,249,183,0.35); }
 .badge-warn{ background:rgba(255,209,102,0.12); color:var(--warn); border-color:rgba(255,209,102,0.35); }
 
-/* ✅ Chat box now AUTO-SIZES (no huge blank space) */
+/*  Chat box now AUTO-SIZES (no huge blank space) */
 .chat-wrap{
   background: rgba(17,24,53,0.55);
   border:1px solid rgba(255,255,255,0.05);
@@ -613,10 +613,12 @@ def openai_fallback(query, context_snippets):
         client = OpenAI(api_key=OPENAI_API_KEY)
 
         system = (
-            "You are a helpful Kenyan retail-banking/SACCO support assistant. "
+            "Your name is Baraka. "
+            "You are a helpful Kenyan retail-banking & SACCO support assistant. "
             "Answer ONLY using the provided context. "
             "If context is insufficient, ask a short follow-up question. "
             "Never request PINs or passwords."
+        
         )
 
         user = (
@@ -716,7 +718,7 @@ def user_home_page():
 
     with col1:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("### 🧾 Submit a Complaint / Inquiry")
+        st.markdown("###  Submit a Complaint / Inquiry")
         st.markdown("<div class='small-muted'>Your complaint will be routed automatically.</div>", unsafe_allow_html=True)
         if st.button("Open Complaint Form"):
             st.session_state.page = "complaint"; st.rerun()
@@ -724,7 +726,7 @@ def user_home_page():
 
     with col2:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("### 💬 Chat with Support Bot")
+        st.markdown("###  Chat with Support Bot")
         st.markdown("<div class='small-muted'>Ask questions and get instant help.</div>", unsafe_allow_html=True)
         if st.button("Open Chat"):
             st.session_state.page = "chat"; st.rerun()
@@ -842,13 +844,13 @@ def chat_page():
         ans, source, score = generate_reply(q, user, dept)
 
         if source == "custom":
-            footer = f"✅ Dept FAQ ({dept})"
+            footer = f" Dept FAQ ({dept})"
         elif source == "base":
-            footer = f"📚 Base dataset ({dept})"
+            footer = f" Base dataset ({dept})"
         elif source == "openai":
-            footer = f"🤖 AI fallback ({dept})"
+            footer = f" AI fallback ({dept})"
         else:
-            footer = f"ℹ️ Low confidence ({dept})"
+            footer = f" Low confidence ({dept})"
 
         st.session_state.messages.append({
             "role": "assistant",
