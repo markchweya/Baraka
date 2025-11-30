@@ -1,12 +1,8 @@
-# app.py — AI Complaint Management + Department Routing + Banking Chatbot (Streamlit)
+# app.py — Baraka: AI Complaint Management + Department Routing + Banking Chatbot (Streamlit)
 #
 # Demo accounts (auto-created / auto-upgraded):
 #   admin / admin123
 #   user  / user123
-#
-# Deployment-safe:
-# - No bcrypt (uses stdlib PBKDF2 hashing)
-# - No datasets lib (loads Bitext parquet via pandas)
 #
 # requirements.txt (repo root):
 # streamlit
@@ -16,9 +12,15 @@
 # pyarrow
 # huggingface-hub
 # fsspec
+#
+# ✅ Uses OPENAI_API_KEY for:
+# - language detect + translation (no offline CPU translator models)
+# - optional AI fallback answers
+
 
 import os
 import re
+import json
 import sqlite3
 import base64
 import hashlib
@@ -31,7 +33,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ----------------------------
 # CONFIG
 # ----------------------------
-APP_NAME = "AI Bank Complaint & Support Bot"
+APP_NAME = "Baraka"
 DB_PATH = "bankbot.db"
 
 BASE_PARQUET_URL = (
@@ -45,6 +47,18 @@ SIM_THRESHOLD_BASE = 0.35
 SIM_THRESHOLD_ROUTE = 0.25
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Translation + fallback
+TRANSLATION_MODEL = "gpt-4.1-mini"
+FALLBACK_MODEL = "gpt-4.1-mini"
+
+LANG_NAME = {
+    "en": "English",
+    "sw": "Kiswahili",
+    "am": "Amharic",
+    "so": "Somali",
+    "ar": "Arabic",
+}
 
 
 # ----------------------------
@@ -71,7 +85,8 @@ DEPT_LABELS = {
 DEPT_TRAIN = {
     "ACCOUNT": [
         "open account", "create account", "close account", "account frozen",
-        "recent transactions", "bank statement", "account verification", "kyc update"
+        "recent transactions", "bank statement", "account verification", "kyc update",
+        "check balance", "account balance"
     ],
     "ATM": [
         "atm swallowed my card", "no cash but debited", "failed withdrawal",
@@ -92,7 +107,7 @@ DEPT_TRAIN = {
     ],
     "LOAN": [
         "apply for loan", "loan repayment", "mortgage", "cancel loan",
-        "loan status", "interest rate"
+        "loan status", "interest rate", "borrow money"
     ],
     "PASSWORD": [
         "reset password", "forgot password", "set up password", "login problem"
@@ -106,13 +121,13 @@ DEPT_TRAIN = {
 DEPT_KEYWORDS = {
     "ATM": ["atm", "cash withdrawal", "swallowed", "debit but no cash"],
     "CARD": ["card", "visa", "mastercard", "debit card", "credit card"],
-    "LOAN": ["loan", "mortgage", "repayment", "interest"],
-    "TRANSFER": ["transfer", "send money", "reversal", "pending"],
-    "PASSWORD": ["password", "pin reset", "forgot"],
-    "FEES": ["fees", "charges", "annual fee"],
-    "FIND": ["find atm", "branch", "nearest atm"],
-    "CONTACT": ["agent", "customer care", "call center"],
-    "ACCOUNT": ["account", "statement", "transactions", "close account"]
+    "LOAN": ["loan", "mortgage", "repayment", "interest", "borrow"],
+    "TRANSFER": ["transfer", "send money", "reversal", "pending", "reverse transaction"],
+    "PASSWORD": ["password", "pin reset", "forgot", "login problem"],
+    "FEES": ["fees", "charges", "annual fee", "pricing"],
+    "FIND": ["find atm", "branch", "nearest atm", "locator"],
+    "CONTACT": ["agent", "customer care", "call center", "contact support"],
+    "ACCOUNT": ["account", "statement", "transactions", "close account", "balance"]
 }
 
 
@@ -174,96 +189,446 @@ def verify_password(password: str, stored) -> bool:
 
 
 # ----------------------------
-# STYLING 
+# MODERN LIGHT UI STYLING (NEW)
 # ----------------------------
 BANK_CSS = """
 <style>
+/* Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+/* Theme tokens */
 :root{
-  --bg:#0b1020;
-  --card:#111835;
-  --muted:#9aa4c7;
-  --accent:#4cc9f0;
-  --accent2:#80ffdb;
-  --text:#e9edff;
-  --ok:#59f9b7;
-  --warn:#ffd166;
+  --bg: #f6f8ff;
+  --bg2:#f8fbff;
+  --card: rgba(255,255,255,0.86);
+  --card2: rgba(255,255,255,0.72);
+  --stroke: rgba(18, 24, 40, 0.10);
+  --stroke2: rgba(18, 24, 40, 0.14);
+  --text:#0b1220;
+  --muted:#556079;
+  --muted2:#6b7280;
+
+  --primary:#5b7cfa;
+  --primary2:#22c55e;
+  --accent:#7c3aed;
+  --warn:#f59e0b;
+  --danger:#ef4444;
+
+  --shadow: 0 16px 40px rgba(16,24,40,0.12);
+  --shadow2: 0 10px 24px rgba(16,24,40,0.10);
+  --radius: 18px;
+  --radius2: 14px;
 }
-.stApp{
-  background:
-    radial-gradient(1200px 700px at 10% -10%, #1a2250 0%, transparent 60%),
-    radial-gradient(1200px 700px at 110% 0%, #10234a 0%, transparent 55%),
-    var(--bg) !important;
-  color: var(--text);
+
+/* Kill Streamlit chrome */
+#MainMenu, footer, header {visibility: hidden;}
+[data-testid="stToolbar"] {display:none !important;}
+[data-testid="stDecoration"] {display:none !important;}
+
+html, body, [data-testid="stAppViewContainer"]{
+  font-family: "Plus Jakarta Sans", Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif !important;
+  background: radial-gradient(1100px 800px at 8% 0%, rgba(91,124,250,0.18), transparent 60%),
+              radial-gradient(1000px 700px at 92% 10%, rgba(124,58,237,0.14), transparent 55%),
+              radial-gradient(900px 650px at 50% 100%, rgba(34,197,94,0.10), transparent 50%),
+              linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%) !important;
+  color: var(--text) !important;
 }
+
+/* Global spacing */
+.block-container{
+  padding-top: 1.1rem !important;
+  padding-bottom: 1.4rem !important;
+  max-width: 1200px;
+}
+
+/* Subtle animated background glows */
+@keyframes floaty {
+  0% { transform: translateY(0px) translateX(0px); filter: blur(0px); }
+  50% { transform: translateY(-10px) translateX(8px); filter: blur(0.2px); }
+  100% { transform: translateY(0px) translateX(0px); filter: blur(0px); }
+}
+.bg-orb{
+  position: fixed;
+  z-index: 0;
+  width: 340px;
+  height: 340px;
+  border-radius: 999px;
+  filter: blur(40px);
+  opacity: 0.55;
+  animation: floaty 7s ease-in-out infinite;
+  pointer-events: none;
+}
+.bg-orb.one{ left: -120px; top:-120px; background: rgba(91,124,250,0.28); }
+.bg-orb.two{ right: -120px; top: 120px; background: rgba(124,58,237,0.22); animation-duration: 9s; }
+.bg-orb.three{ left: 35%; bottom: -160px; background: rgba(34,197,94,0.18); animation-duration: 11s; }
+
+/* Card */
 .bank-card{
-  background: linear-gradient(180deg, #121a3a 0%, #0e1530 100%);
-  border:1px solid rgba(255,255,255,0.06);
-  border-radius:18px; padding:16px 18px;
-  box-shadow:0 10px 30px rgba(0,0,0,0.35);
+  position: relative;
+  z-index: 1;
+  background: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.78) 100%);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 18px 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  overflow: hidden;
+  animation: fadeUp 240ms ease-out both;
 }
-.small-muted{ color:var(--muted); font-size:0.9rem; }
+@keyframes fadeUp{
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0px); }
+}
+
+/* Nice header "chip" / badge */
 .badge{
-  display:inline-flex; gap:6px; align-items:center;
-  background:rgba(76,201,240,0.12); color:var(--accent);
-  border:1px solid rgba(76,201,240,0.35);
-  padding:4px 10px; border-radius:999px;
-  font-size:12px; font-weight:600;
+  display:inline-flex;
+  gap:8px;
+  align-items:center;
+  padding:6px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: #1f2a44;
+  background: rgba(91,124,250,0.12);
+  border: 1px solid rgba(91,124,250,0.20);
+  box-shadow: 0 6px 16px rgba(91,124,250,0.08);
 }
-.badge-ok{ background:rgba(89,249,183,0.12); color:var(--ok); border-color:rgba(89,249,183,0.35); }
-.badge-warn{ background:rgba(255,209,102,0.12); color:var(--warn); border-color:rgba(255,209,102,0.35); }
+.badge-ok{ background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.20); }
+.badge-warn{ background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.22); }
 
-/*  Chat box now AUTO-SIZES (no huge blank space) */
+.small-muted{
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+/* Titles */
+h1,h2,h3,h4{
+  letter-spacing: -0.02em;
+}
+h2{ font-weight: 750; }
+h3{ font-weight: 750; }
+a, a:visited{ color: var(--primary); }
+
+/* Buttons (all) */
+.stButton button, button[kind="primary"]{
+  border: 1px solid rgba(91,124,250,0.25) !important;
+  background: linear-gradient(135deg, rgba(91,124,250,0.98) 0%, rgba(124,58,237,0.94) 100%) !important;
+  color: white !important;
+  font-weight: 700 !important;
+  border-radius: 14px !important;
+  padding: 0.68rem 1.05rem !important;
+  box-shadow: 0 12px 22px rgba(91,124,250,0.22) !important;
+  transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease !important;
+}
+.stButton button:hover{
+  transform: translateY(-1px) scale(1.01);
+  box-shadow: 0 16px 30px rgba(91,124,250,0.28) !important;
+  filter: saturate(1.05);
+}
+.stButton button:active{
+  transform: translateY(0px) scale(0.99);
+  box-shadow: 0 10px 18px rgba(91,124,250,0.18) !important;
+}
+
+/* Secondary buttons: Streamlit sometimes renders different kinds */
+button[kind="secondary"], .stButton button[kind="secondary"]{
+  background: rgba(255,255,255,0.72) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--stroke2) !important;
+  box-shadow: var(--shadow2) !important;
+}
+
+/* Inputs */
+label{ color: #111827 !important; font-weight: 650 !important; }
+.stTextInput input, .stTextArea textarea, .stSelectbox select, .stMultiSelect div, .stNumberInput input{
+  background: rgba(255,255,255,0.88) !important;
+  border: 1px solid var(--stroke2) !important;
+  color: var(--text) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 10px 20px rgba(16,24,40,0.06);
+  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+.stTextInput input:focus, .stTextArea textarea:focus, .stSelectbox select:focus{
+  border-color: rgba(91,124,250,0.55) !important;
+  box-shadow: 0 14px 26px rgba(91,124,250,0.14) !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"]{
+  gap: 10px;
+}
+.stTabs [data-baseweb="tab"]{
+  border-radius: 999px !important;
+  border: 1px solid var(--stroke2) !important;
+  background: rgba(255,255,255,0.66) !important;
+  padding: 10px 14px !important;
+  font-weight: 700 !important;
+  color: #24324a !important;
+  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+.stTabs [aria-selected="true"]{
+  background: linear-gradient(135deg, rgba(91,124,250,0.16) 0%, rgba(124,58,237,0.12) 100%) !important;
+  border-color: rgba(91,124,250,0.30) !important;
+  box-shadow: 0 12px 22px rgba(91,124,250,0.10);
+  transform: translateY(-1px);
+}
+
+/* Dataframes / tables */
+[data-testid="stDataFrame"]{
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--stroke);
+  box-shadow: 0 16px 30px rgba(16,24,40,0.10);
+}
+[data-testid="stTable"]{
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+/* Chat container */
 .chat-wrap{
-  background: rgba(17,24,53,0.55);
-  border:1px solid rgba(255,255,255,0.05);
-  border-radius:18px;
-  padding:12px;
-  max-height: 60vh;     /* scroll only when needed */
-  min-height: 180px;    /* small polite height when few messages */
-  overflow-y:auto;
+  position: relative;
+  z-index: 1;
+  background: rgba(255,255,255,0.78);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 12px;
+  max-height: 60vh;
+  min-height: 200px;
+  overflow-y: auto;
+  box-shadow: var(--shadow2);
 }
 
-/* tighter spacing for bubbles */
+/* Nice scrollbar */
+.chat-wrap::-webkit-scrollbar{ width: 10px; }
+.chat-wrap::-webkit-scrollbar-track{ background: rgba(17,24,39,0.06); border-radius: 999px;}
+.chat-wrap::-webkit-scrollbar-thumb{
+  background: rgba(91,124,250,0.25);
+  border-radius: 999px;
+  border: 2px solid rgba(255,255,255,0.55);
+}
+.chat-wrap::-webkit-scrollbar-thumb:hover{ background: rgba(91,124,250,0.35); }
+
+/* Chat bubbles */
 .bubble{
+  width: fit-content;
   max-width: 78%;
-  padding:10px 12px; border-radius:14px; margin:4px 0;
-  line-height:1.5; font-size:0.98rem;
-  white-space:pre-wrap;
+  padding: 10px 12px;
+  border-radius: 16px;
+  margin: 8px 0;
+  line-height: 1.55;
+  font-size: 0.98rem;
+  white-space: pre-wrap;
+  animation: popIn 140ms ease-out both;
+}
+@keyframes popIn{
+  from{ opacity:0; transform: translateY(4px) scale(0.985); }
+  to{ opacity:1; transform: translateY(0px) scale(1); }
 }
 .user{
-  margin-left:auto; background:rgba(76,201,240,0.16);
-  border:1px solid rgba(76,201,240,0.35);
+  margin-left: auto;
+  background: linear-gradient(135deg, rgba(91,124,250,0.18) 0%, rgba(124,58,237,0.12) 100%);
+  border: 1px solid rgba(91,124,250,0.22);
 }
 .bot{
-  margin-right:auto; background:rgba(255,255,255,0.05);
-  border:1px solid rgba(255,255,255,0.08);
+  margin-right: auto;
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--stroke2);
 }
+
+/* Ticket panel */
 .ticket{
-  background:#0f1632; border:1px dashed rgba(255,255,255,0.12);
-  border-radius:14px; padding:10px 12px; margin-top:8px;
+  background: rgba(255,255,255,0.80);
+  border: 1px dashed rgba(91,124,250,0.35);
+  border-radius: 16px;
+  padding: 12px 14px;
+  margin-top: 10px;
+  box-shadow: 0 16px 26px rgba(91,124,250,0.10);
 }
 
-/* input area styling */
+/* Input card */
 .input-card{
-  background: rgba(17,24,53,0.7);
-  border:1px solid rgba(255,255,255,0.06);
-  border-radius:16px;
-  padding:10px 12px;
+  position: relative;
+  z-index: 1;
+  background: rgba(255,255,255,0.78);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 12px 12px;
+  box-shadow: var(--shadow2);
 }
 
-.stButton button{
-  background: linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
-  color:#071021; font-weight:700; border:none; border-radius:12px;
-  padding:0.6rem 1rem;
+/* Reduce horizontal rules */
+hr{
+  border: none;
+  border-top: 1px solid rgba(17,24,39,0.10);
+  margin: 12px 0;
 }
-.stTextInput input, .stTextArea textarea, .stSelectbox select{
-  background:#0f1632 !important; color:var(--text) !important;
-  border:1px solid rgba(255,255,255,0.12) !important;
-  border-radius:12px !important;
+
+/* Alerts: make them look cleaner */
+[data-testid="stAlert"]{
+  border-radius: 16px !important;
+  border: 1px solid rgba(17,24,39,0.10) !important;
+  box-shadow: 0 14px 26px rgba(16,24,40,0.08) !important;
 }
-hr{ border:none; border-top:1px solid rgba(255,255,255,0.08); margin:10px 0; }
+
+/* Mobile */
+@media (max-width: 720px){
+  .block-container{ padding: 0.8rem 0.8rem 1.2rem 0.8rem !important; }
+  .bubble{ max-width: 90%; }
+}
 </style>
+
+<div class="bg-orb one"></div>
+<div class="bg-orb two"></div>
+<div class="bg-orb three"></div>
 """
+
+
+# ----------------------------
+# OPENAI CLIENT (API KEY ONLY)
+# ----------------------------
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        return None
+
+
+# ----------------------------
+# PLACEHOLDER PROTECTION (so templates like {amount} don't get translated)
+# ----------------------------
+_PLACEHOLDER_RE = re.compile(r"(\{\{[^{}]*\}\}|\{[^{}]*\}|<[^<>]*>)")
+
+def protect_placeholders(text: str):
+    mapping = {}
+    def repl(m):
+        key = f"@@PH{len(mapping)}@@"
+        mapping[key] = m.group(0)
+        return key
+    return _PLACEHOLDER_RE.sub(repl, text), mapping
+
+def restore_placeholders(text: str, mapping: dict):
+    out = text
+    for k in sorted(mapping.keys(), key=len, reverse=True):
+        out = out.replace(k, mapping[k])
+    return out
+
+
+# ----------------------------
+# LANGUAGE: detect + translate to English + translate back
+# ----------------------------
+def detect_and_translate_to_english(user_text: str):
+    """
+    Returns: (detected_lang_code, english_text)
+    detected_lang_code in: en, sw, am, so, ar (fallback: en)
+    """
+    client = get_openai_client()
+    if not client:
+        return "en", user_text
+
+    protected, mapping = protect_placeholders(user_text)
+
+    system = (
+        "You are a language detector and translator.\n"
+        "Task:\n"
+        "1) Detect the language of the INPUT.\n"
+        "2) Translate the INPUT to English.\n\n"
+        "Return ONLY valid JSON with keys: lang, english.\n"
+        "lang must be one of: en, sw, am, so, ar.\n"
+        "Preserve any placeholders exactly (tokens like @@PH0@@). Do NOT change them."
+    )
+    user = f"INPUT:\n{protected}"
+
+    try:
+        resp = client.responses.create(
+            model=TRANSLATION_MODEL,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0
+        )
+        raw = (resp.output_text or "").strip()
+        data = json.loads(raw)
+
+        lang = str(data.get("lang", "en")).strip().lower()
+        eng = str(data.get("english", protected))
+
+        if lang not in ("en", "sw", "am", "so", "ar"):
+            lang = "en"
+
+        eng = restore_placeholders(eng, mapping)
+        return lang, eng
+    except Exception:
+        return "en", user_text
+
+
+def translate_from_english(text_en: str, target_lang: str):
+    if target_lang == "en":
+        return text_en
+
+    client = get_openai_client()
+    if not client:
+        return text_en
+
+    protected, mapping = protect_placeholders(text_en)
+
+    system = (
+        "You are a professional translator.\n"
+        f"Translate from English to {LANG_NAME.get(target_lang, target_lang)}.\n"
+        "Rules:\n"
+        "- Output ONLY the translation, no explanations.\n"
+        "- Preserve placeholders exactly (tokens like @@PH0@@). Do NOT change them.\n"
+        "- Keep numbers, currency, and product names unchanged unless the target language normally uses a different script."
+    )
+
+    try:
+        resp = client.responses.create(
+            model=TRANSLATION_MODEL,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": protected},
+            ],
+            temperature=0
+        )
+        out = (resp.output_text or "").strip()
+        out = restore_placeholders(out, mapping)
+        return out
+    except Exception:
+        return text_en
+
+
+def handle_language_command(user_text: str):
+    """
+    Optional explicit commands:
+      - "jibu kwa kiswahili"
+      - "reply in amharic"
+      - "somali"
+      - "arabic"
+      - "english"
+    """
+    t = str(user_text).strip().lower()
+    if not t:
+        return False, None, None
+
+    if "kiswahili" in t or "swahili" in t:
+        return True, "Sawa—nitajibu kwa Kiswahili kuanzia sasa.", "sw"
+    if "amharic" in t or "አማርኛ" in user_text:
+        return True, "እሺ — ከአሁን በኋላ በአማርኛ እመልሳለሁ።", "am"
+    if "somali" in t or "soomaali" in t:
+        return True, "Haye—laga bilaabo hadda waxaan ku jawaabi doonaa Af-Soomaali.", "so"
+    if "arabic" in t or "العربية" in user_text or "عربي" in user_text:
+        return True, "حسنًا — سأجيب بالعربية من الآن فصاعدًا.", "ar"
+    if "english" in t:
+        return True, "Okay—I'll reply in English from now on.", "en"
+
+    return False, None, None
 
 
 # ----------------------------
@@ -354,7 +719,6 @@ def init_db():
     if not column_exists(conn, "chat_logs", "department"):
         c.execute("ALTER TABLE chat_logs ADD COLUMN department TEXT")
 
-    # clean legacy GENERAL
     c.execute("UPDATE custom_faqs SET department='CONTACT' WHERE UPPER(department)='GENERAL'")
 
     seed_or_upgrade_user(c, "admin", "admin123", "admin")
@@ -475,9 +839,9 @@ def update_complaint(cid, status=None, priority=None, internal_notes=None):
 
 
 # ----------------------------
-# DATASET LOADING (no datasets lib)
+# DATASET LOADING
 # ----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_base_dataset():
     df = pd.read_parquet(BASE_PARQUET_URL)
     cols = {c.lower(): c for c in df.columns}
@@ -514,8 +878,7 @@ def load_base_dataset():
     base_df.reset_index(drop=True, inplace=True)
     return base_df
 
-
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def build_vector_index(texts):
     texts = [t for t in texts if isinstance(t, str) and t.strip()]
     if len(texts) < 3:
@@ -534,7 +897,7 @@ def normalize(text):
     text = re.sub(r"\s+", " ", text)
     return text
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def build_dept_router():
     dept_texts = []
     dept_labels = []
@@ -545,8 +908,8 @@ def build_dept_router():
     vec, X = build_vector_index(dept_texts)
     return vec, X, dept_labels
 
-def route_department(text):
-    t = normalize(text)
+def route_department(text_en):
+    t = normalize(text_en)
 
     for dept, kws in DEPT_KEYWORDS.items():
         for kw in kws:
@@ -564,8 +927,8 @@ def route_department(text):
         return "CONTACT", best_score, "tfidf_lowconf"
     return best_dept, best_score, "tfidf"
 
-def retrieve_best(query, faq_df, vec, X, topk=TOPK):
-    qn = normalize(query)
+def retrieve_best(query_en, faq_df, vec, X, topk=TOPK):
+    qn = normalize(query_en)
     qv = vec.transform([qn])
     sims = cosine_similarity(qv, X).flatten()
     idxs = sims.argsort()[::-1][:topk]
@@ -573,7 +936,7 @@ def retrieve_best(query, faq_df, vec, X, topk=TOPK):
     results["score"] = sims[idxs]
     return results
 
-def answer_from_custom_first(query, dept):
+def answer_from_custom_first(query_en, dept):
     custom_df = fetch_custom_faqs(dept)
     if custom_df.empty:
         return None
@@ -583,142 +946,160 @@ def answer_from_custom_first(query, dept):
         return None
 
     vec_c, X_c = build_vector_index(questions)
-    res = retrieve_best(query, custom_df, vec_c, X_c, topk=TOPK)
+    res = retrieve_best(query_en, custom_df, vec_c, X_c, topk=TOPK)
     best = res.iloc[0]
     if float(best["score"]) >= SIM_THRESHOLD_CUSTOM:
         return best["answer"], float(best["score"]), "custom"
     return None
 
-def answer_from_base(query, dept, base_df):
+def answer_from_base(query_en, dept, base_df):
     base_dept = base_df[base_df["category"] == dept]
     if base_dept.empty:
         base_dept = base_df
 
     vec_d, X_d = build_vector_index(base_dept["question"].tolist())
-    res = retrieve_best(query, base_dept, vec_d, X_d, topk=TOPK)
+    res = retrieve_best(query_en, base_dept, vec_d, X_d, topk=TOPK)
     best = res.iloc[0]
     if float(best["score"]) >= SIM_THRESHOLD_BASE:
         return best["answer"], float(best["score"]), "base"
     return None
 
-def openai_fallback(query, context_snippets):
-    if not OPENAI_API_KEY:
-        return (
-            "I’m not fully confident yet. Please rephrase or add more detail.",
-            0.0, "fallback"
-        )
+def openai_fallback(query_en, context_snippets, out_lang="en"):
+    client = get_openai_client()
+    if not client:
+        return ("I’m not fully confident yet. Please rephrase or add more detail.", 0.0, "fallback")
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
         system = (
             "Your name is Baraka. "
             "You are a helpful Kenyan retail-banking & SACCO support assistant. "
             "Answer ONLY using the provided context. "
             "If context is insufficient, ask a short follow-up question. "
-            "Never request PINs or passwords."
-        
+            "Never request PINs or passwords. "
+            f"Reply in {LANG_NAME.get(out_lang, 'English')}."
         )
-
         user = (
-            f"Customer question: {query}\n\n"
-            "Context (FAQ snippets):\n" + "\n---\n".join(context_snippets)
+            f"Customer question (English): {query_en}\n\n"
+            "Context (FAQ snippets, English):\n" + "\n---\n".join(context_snippets)
         )
 
         resp = client.responses.create(
-            model="gpt-4.1-mini",
+            model=FALLBACK_MODEL,
             input=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ],
             temperature=0.2
         )
-
-        return resp.output_text.strip(), 0.0, "openai"
-
+        return (resp.output_text or "").strip(), 0.0, "openai"
     except Exception:
-        return (
-            "AI fallback is unavailable right now. I’ll answer using SACCO FAQs.",
-            0.0, "fallback"
-        )
+        return ("AI fallback is unavailable right now. I’ll answer using SACCO FAQs.", 0.0, "fallback")
 
-def generate_reply(query, username, dept):
+def generate_reply(user_message_raw, query_en, username, dept, out_lang):
     base_df = load_base_dataset()
 
-    custom_hit = answer_from_custom_first(query, dept)
+    custom_hit = answer_from_custom_first(query_en, dept)
     if custom_hit:
-        ans, score, source = custom_hit
-        log_chat(username, query, ans, source, score, dept)
-        return ans, source, score
+        ans_en, score, source = custom_hit
+        ans_out = translate_from_english(ans_en, out_lang)
+        log_chat(username, user_message_raw, ans_out, source, score, dept)
+        return ans_out, source, score
 
-    base_hit = answer_from_base(query, dept, base_df)
+    base_hit = answer_from_base(query_en, dept, base_df)
     if base_hit:
-        ans, score, source = base_hit
-        log_chat(username, query, ans, source, score, dept)
-        return ans, source, score
+        ans_en, score, source = base_hit
+        ans_out = translate_from_english(ans_en, out_lang)
+        log_chat(username, user_message_raw, ans_out, source, score, dept)
+        return ans_out, source, score
 
     vec_b, X_b = build_vector_index(base_df["question"].tolist())
-    top_base = retrieve_best(query, base_df, vec_b, X_b, topk=TOPK)
+    top_base = retrieve_best(query_en, base_df, vec_b, X_b, topk=TOPK)
     snippets = [f"Q: {r.question}\nA: {r.answer}" for r in top_base.itertuples()]
-    ans, score, source = openai_fallback(query, snippets)
-    log_chat(username, query, ans, source, score, dept)
-    return ans, source, score
+
+    ans_out, score, source = openai_fallback(query_en, snippets, out_lang=out_lang)
+    log_chat(username, user_message_raw, ans_out, source, score, dept)
+    return ans_out, source, score
 
 
 # ----------------------------
 # UI PAGES
 # ----------------------------
-def login_page():
+def render_brand_header(title, subtitle, badge_text="Baraka"):
     st.markdown(BANK_CSS, unsafe_allow_html=True)
     st.markdown(f"""
-    <div class="bank-card">
-      <h2 style="margin:0;">{APP_NAME}</h2>
-      <p class="small-muted">
-        Submit complaints, get routed to the right department, and receive instant SACCO/bank support.
-      </p>
-      <span class="badge">Kenya-ready</span>
-      <div class="small-muted" style="margin-top:8px;">
-        Demo accounts: <b>admin/admin123</b> or <b>user/user123</b>
+    <div class="bank-card" style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start;">
+      <div style="min-width:60%;">
+        <h2 style="margin:0;line-height:1.1;">{title}</h2>
+        <div class="small-muted" style="margin-top:8px;">{subtitle}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;align-items:flex-end;">
+        <span class="badge">{badge_text}</span>
+        <span class="badge badge-ok">Modern • Light UI</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    with st.form("login"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
+def login_page():
+    render_brand_header(
+        title=f"{APP_NAME}",
+        subtitle="Sign in to submit complaints, get routed to the right department, and chat with a support bot.",
+        badge_text="Kenya-ready"
+    )
 
-    if submitted:
-        role = verify_user(username, password)
-        if role:
-            st.session_state.user = username
-            st.session_state.role = role
-            st.session_state.page = "home" if role == "user" else "admin"
-            st.rerun()
-        else:
-            st.error("Invalid username/password.")
+    left, right = st.columns([1.2, 1.0], vertical_alignment="top")
 
+    with left:
+        st.markdown("""
+        <div class="bank-card">
+          <h3 style="margin:0;">Welcome back ✨</h3>
+          <div class="small-muted" style="margin-top:8px;">
+            Demo accounts:<br>
+            <b>admin / admin123</b><br>
+            <b>user / user123</b>
+          </div>
+          <hr/>
+          <div class="small-muted">
+            Tip: You can chat in <b>Swahili, Amharic, Somali</b> or <b>Arabic</b>.
+            Baraka will auto-detect and reply in the same language.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with right:
+        st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+        st.markdown("### Sign in")
+        with st.form("login"):
+            username = st.text_input("Username", placeholder="e.g., admin")
+            password = st.text_input("Password", type="password", placeholder="••••••••")
+            submitted = st.form_submit_button("Login")
+
+        if submitted:
+            role = verify_user(username, password)
+            if role:
+                st.session_state.user = username
+                st.session_state.role = role
+                st.session_state.page = "home" if role == "user" else "admin"
+                st.rerun()
+            else:
+                st.error("Invalid username/password.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if not OPENAI_API_KEY:
+        st.warning("OPENAI_API_KEY is not set. Multilingual auto-translation and AI fallback need the API key.")
 
 def user_home_page():
-    st.markdown(BANK_CSS, unsafe_allow_html=True)
     user = st.session_state.user
-
-    st.markdown(f"""
-    <div class="bank-card" style="display:flex;justify-content:space-between;align-items:center;">
-      <div>
-        <h3 style="margin:0;">Welcome, {user}</h3>
-        <div class="small-muted">Choose what you want to do today.</div>
-      </div>
-      <div><span class="badge">Customer Portal</span></div>
-    </div>
-    """, unsafe_allow_html=True)
+    render_brand_header(
+        title=f"Hello, {user}",
+        subtitle="Choose what you want to do today.",
+        badge_text="Customer Portal"
+    )
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("###  Submit a Complaint / Inquiry")
+        st.markdown("### 📝 Submit a Complaint / Inquiry")
         st.markdown("<div class='small-muted'>Your complaint will be routed automatically.</div>", unsafe_allow_html=True)
         if st.button("Open Complaint Form"):
             st.session_state.page = "complaint"; st.rerun()
@@ -726,28 +1107,25 @@ def user_home_page():
 
     with col2:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("###  Chat with Support Bot")
+        st.markdown("### 💬 Chat with Baraka")
         st.markdown("<div class='small-muted'>Ask questions and get instant help.</div>", unsafe_allow_html=True)
         if st.button("Open Chat"):
             st.session_state.page = "chat"; st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
     if st.button("Logout"):
-        for k in ["user", "role", "page", "messages", "active_ticket"]:
+        for k in ["user", "role", "page", "messages", "active_ticket", "preferred_lang"]:
             st.session_state.pop(k, None)
         st.rerun()
 
-
 def complaint_page():
-    st.markdown(BANK_CSS, unsafe_allow_html=True)
     user = st.session_state.user
-
-    st.markdown(f"""
-    <div class="bank-card">
-      <h3 style="margin:0;">Submit Complaint / Inquiry</h3>
-      <div class="small-muted">Describe your issue clearly. We'll route it automatically.</div>
-    </div>
-    """, unsafe_allow_html=True)
+    render_brand_header(
+        title="Submit Complaint / Inquiry",
+        subtitle="Describe your issue clearly — Baraka will route it automatically and reply instantly.",
+        badge_text="Smart Routing"
+    )
 
     with st.form("complaint_form", clear_on_submit=True):
         text = st.text_area("Complaint / Inquiry", height=140,
@@ -756,10 +1134,16 @@ def complaint_page():
         submitted = st.form_submit_button("Submit")
 
     if submitted and text.strip():
-        dept, score, method = route_department(text)
+        if not OPENAI_API_KEY:
+            st.error("OPENAI_API_KEY is not set. Please set your API key to enable multilingual support.")
+            return
+
+        detected_lang, text_en = detect_and_translate_to_english(text.strip())
+        out_lang = st.session_state.get("preferred_lang") or detected_lang
+
+        dept, score, method = route_department(text_en)
         summary = text.strip()[:180] + ("..." if len(text.strip()) > 180 else "")
-        ticket_id = create_complaint(user, text.strip(), dept,
-                                     priority=priority, summary=summary)
+        ticket_id = create_complaint(user, text.strip(), dept, priority=priority, summary=summary)
         st.session_state.active_ticket = ticket_id
 
         st.success("Complaint submitted successfully.")
@@ -769,14 +1153,14 @@ def complaint_page():
           <div><b>Routed Department:</b> {dept} — {DEPT_LABELS.get(dept, dept)}</div>
           <div><b>Routing Confidence:</b> {score:.2f} ({method})</div>
           <div class="small-muted" style="margin-top:6px;">
-            An agent will review your case. The bot will assist below.
+            An agent can review your case. Baraka will assist below.
           </div>
         </div>
         """, unsafe_allow_html=True)
 
-        ans, source, sc = generate_reply(text, user, dept)
+        ans, source, sc = generate_reply(text.strip(), text_en, user, dept, out_lang)
         st.markdown("<hr/>", unsafe_allow_html=True)
-        st.markdown("### Instant Support Bot Reply")
+        st.markdown("### Baraka’s Instant Reply")
         st.markdown(f"<div class='bank-card'>{ans}</div>", unsafe_allow_html=True)
         st.caption(f"Source: {source} | Similarity: {sc:.2f}")
 
@@ -788,60 +1172,68 @@ def complaint_page():
         if st.button("Go to Chat"):
             st.session_state.page = "chat"; st.rerun()
 
-
 def chat_page():
-    st.markdown(BANK_CSS, unsafe_allow_html=True)
     user = st.session_state.user
+    render_brand_header(
+        title="Chat with Baraka",
+        subtitle="Ask anything — Baraka will auto-detect your language and reply accordingly.",
+        badge_text="Live Support"
+    )
 
-    st.markdown(f"""
-    <div class="bank-card" style="display:flex;justify-content:space-between;align-items:center;">
-      <div>
-        <h3 style="margin:0;">Customer Chat</h3>
-        <div class="small-muted">Ask anything. We’ll route your message automatically.</div>
-      </div>
-      <div><span class="badge">Online Support</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ✅ Seed a welcome message so chat never looks empty
+    # Seed welcome message
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if len(st.session_state.messages) == 0:
         st.session_state.messages.append({
             "role": "assistant",
             "content": (
-                "Hi! 👋 I’m your SACCO support bot.\n"
-                "You can ask about accounts, cards, loans, ATM issues, transfers, fees, "
-                "or submit a complaint and I’ll route it to the right department."
+                "Hi! 👋 I’m Baraka.\n"
+                "Ask about accounts, cards, loans, ATM issues, transfers, fees — "
+                "or submit a complaint and I’ll route it to the right department.\n\n"
+                "You can write in Kiswahili, Amharic, Somali, Arabic, or English."
             )
         })
 
     if st.session_state.get("active_ticket"):
         st.caption(f"Active ticket: #{st.session_state.active_ticket}")
 
-    # Chat messages (auto height, no huge blank space)
     st.markdown('<div class="chat-wrap">', unsafe_allow_html=True)
     for m in st.session_state.messages:
         cls = "user" if m["role"] == "user" else "bot"
         st.markdown(f'<div class="bubble {cls}">{m["content"]}</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Input area
     st.markdown('<div class="input-card">', unsafe_allow_html=True)
     with st.form("chat_form", clear_on_submit=True):
         col1, col2 = st.columns([6, 1])
         with col1:
-            q = st.text_input("Type your question...", key="user_input")
+            q = st.text_input("Type your question...", key="user_input", placeholder="e.g., nataka kukopa shilingi elfu kumi")
         with col2:
             send = st.form_submit_button("Send")
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     if send and q.strip():
-        dept, dscore, dmethod = route_department(q)
+        handled, msg, forced = handle_language_command(q.strip())
+        if handled:
+            st.session_state.preferred_lang = forced
+            st.session_state.messages.append({"role": "user", "content": q.strip()})
+            st.session_state.messages.append({"role": "assistant", "content": msg})
+            st.rerun()
 
-        st.session_state.messages.append({"role": "user", "content": q})
-        ans, source, score = generate_reply(q, user, dept)
+        st.session_state.messages.append({"role": "user", "content": q.strip()})
+
+        if not OPENAI_API_KEY:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "OPENAI_API_KEY is not set. Please set your API key to enable translation + multilingual support."
+            })
+            st.rerun()
+
+        detected_lang, q_en = detect_and_translate_to_english(q.strip())
+        out_lang = st.session_state.get("preferred_lang") or detected_lang
+
+        dept, dscore, dmethod = route_department(q_en)
+        ans, source, score = generate_reply(q.strip(), q_en, user, dept, out_lang)
 
         if source == "custom":
             footer = f" Dept FAQ ({dept})"
@@ -869,23 +1261,17 @@ def chat_page():
             st.session_state.page = "home"; st.rerun()
     with c2:
         if st.button("Logout"):
-            for k in ["user", "role", "page", "messages", "active_ticket"]:
+            for k in ["user", "role", "page", "messages", "active_ticket", "preferred_lang"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
-
 def admin_page():
-    st.markdown(BANK_CSS, unsafe_allow_html=True)
     admin = st.session_state.user
-
-    st.markdown(f"""
-    <div class="bank-card">
-      <h3 style="margin:0;">Admin Console</h3>
-      <div class="small-muted">
-        Logged in as <b>{admin}</b>. Manage department FAQs, complaints, and logs.
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    render_brand_header(
+        title="Admin Console",
+        subtitle=f"Logged in as {admin}. Manage department FAQs, complaints, and logs.",
+        badge_text="Admin"
+    )
 
     tabs = st.tabs([
         "➕ Add Dept FAQ",
@@ -896,10 +1282,11 @@ def admin_page():
 
     with tabs[0]:
         st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+        st.markdown("### Create a new FAQ")
         dept = st.selectbox("Department", DEPARTMENTS)
-        q = st.text_area("Customer Question")
-        a = st.text_area("Official Answer")
-        tags = st.text_input("Tags / Keywords (comma separated)")
+        q = st.text_area("Customer Question", placeholder="e.g., How do I reset my PIN?")
+        a = st.text_area("Official Answer", placeholder="Provide the official guidance…")
+        tags = st.text_input("Tags / Keywords (comma separated)", placeholder="pin, reset, password")
         save = st.button("Save FAQ")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -918,21 +1305,23 @@ def admin_page():
             st.info("No custom FAQs yet.")
         else:
             st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.dataframe(df[["id","department","question","answer","tags","updated_at"]],
-                         use_container_width=True)
+            st.markdown("### Existing FAQs")
+            st.dataframe(df[["id","department","question","answer","tags","updated_at"]], use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
-            edit_id = st.selectbox("Select FAQ ID to edit/delete", df["id"].tolist())
+            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+            st.markdown("### Edit / Delete FAQ")
+            edit_id = st.selectbox("Select FAQ ID", df["id"].tolist())
             row = df[df["id"] == edit_id].iloc[0]
 
             new_dept = st.selectbox(
-                "Edit Department",
+                "Department",
                 DEPARTMENTS,
                 index=safe_index(DEPARTMENTS, row.get("department"), fallback_value="CONTACT")
             )
-            new_q = st.text_area("Edit Question", value=row["question"])
-            new_a = st.text_area("Edit Answer", value=row["answer"])
-            new_tags = st.text_input("Edit Tags", value=row.get("tags","") or "")
+            new_q = st.text_area("Question", value=row["question"])
+            new_a = st.text_area("Answer", value=row["answer"])
+            new_tags = st.text_input("Tags", value=row.get("tags","") or "")
 
             colE, colD = st.columns(2)
             with colE:
@@ -943,6 +1332,7 @@ def admin_page():
                 if st.button("Delete FAQ"):
                     delete_custom_faq(edit_id)
                     st.warning("FAQ deleted."); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
     with tabs[2]:
         STATUS_OPTS = ["Open", "In Review", "Resolved", "Rejected"]
@@ -960,6 +1350,7 @@ def admin_page():
             st.info("No complaints found.")
         else:
             st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+            st.markdown("### Complaint Queue")
             st.dataframe(
                 comp_df[["id","username","department","priority","status","summary","created_at"]],
                 use_container_width=True
@@ -970,7 +1361,7 @@ def admin_page():
             row = comp_df[comp_df["id"] == cid].iloc[0]
 
             st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown(f"**Ticket #{cid}**")
+            st.markdown(f"### Ticket #{cid}")
             st.write(f"**Customer:** {row['username']}")
             st.write(f"**Department:** {row['department']} — {DEPT_LABELS.get(row['department'], row['department'])}")
             st.write(f"**Priority:** {row['priority']}")
@@ -979,38 +1370,40 @@ def admin_page():
             st.write(row["text"])
             st.markdown("</div>", unsafe_allow_html=True)
 
+            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+            st.markdown("### Update Ticket")
             new_status = st.selectbox(
-                "Update Status",
+                "Status",
                 STATUS_OPTS,
                 index=safe_index(STATUS_OPTS, row.get("status"), fallback_value="Open")
             )
             new_priority = st.selectbox(
-                "Update Priority",
+                "Priority",
                 PRIORITY_OPTS,
                 index=safe_index(PRIORITY_OPTS, row.get("priority"), fallback_value="Normal")
             )
             notes = st.text_area("Internal Notes", value=row.get("internal_notes") or "", height=120)
 
-            if st.button("Save Complaint Updates"):
+            if st.button("Save Updates"):
                 update_complaint(cid, status=new_status, priority=new_priority, internal_notes=notes)
                 st.success("Complaint updated."); st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
     with tabs[3]:
         conn = get_conn()
-        logs = pd.read_sql_query(
-            "SELECT * FROM chat_logs ORDER BY created_at DESC LIMIT 800",
-            conn
-        )
+        logs = pd.read_sql_query("SELECT * FROM chat_logs ORDER BY created_at DESC LIMIT 800", conn)
         conn.close()
+
         if logs.empty:
             st.info("No chats yet.")
         else:
             st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+            st.markdown("### Chat Logs")
             st.dataframe(logs, use_container_width=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
     if st.button("Logout"):
-        for k in ["user","role","page","messages","active_ticket"]:
+        for k in ["user","role","page","messages","active_ticket","preferred_lang"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -1019,11 +1412,13 @@ def admin_page():
 # APP ROUTER
 # ----------------------------
 def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="🏦", layout="wide")
+    st.set_page_config(page_title=APP_NAME, page_icon="✨", layout="wide")
     init_db()
 
     if "page" not in st.session_state:
         st.session_state.page = "login"
+    if "preferred_lang" not in st.session_state:
+        st.session_state.preferred_lang = None
 
     page = st.session_state.page
     role = st.session_state.get("role")
