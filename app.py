@@ -1,10 +1,10 @@
-# app.py — Baraka: AI Complaint Management + Department Routing + Banking Chatbot (Streamlit)
+# app.py — Baraka (Modern UI) + Complaint Management + Department Routing + Multilingual Chatbot
 #
-# Demo accounts (auto-created / auto-upgraded):
+# Demo accounts:
 #   admin / admin123
 #   user  / user123
 #
-# requirements.txt (repo root):
+# requirements:
 # streamlit
 # openai
 # pandas
@@ -12,11 +12,6 @@
 # pyarrow
 # huggingface-hub
 # fsspec
-#
-# ✅ Uses OPENAI_API_KEY for:
-# - language detect + translation (no offline CPU translator models)
-# - optional AI fallback answers
-
 
 import os
 import re
@@ -24,8 +19,11 @@ import json
 import sqlite3
 import base64
 import hashlib
+from typing import Tuple, Optional
+
 import pandas as pd
 import streamlit as st
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -47,22 +45,32 @@ SIM_THRESHOLD_BASE = 0.35
 SIM_THRESHOLD_ROUTE = 0.25
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Translation + fallback
 TRANSLATION_MODEL = "gpt-4.1-mini"
 FALLBACK_MODEL = "gpt-4.1-mini"
 
-LANG_NAME = {
+
+# ----------------------------
+# LANGUAGES (expanded)
+# ----------------------------
+LANGS = {
     "en": "English",
     "sw": "Kiswahili",
     "am": "Amharic",
     "so": "Somali",
     "ar": "Arabic",
+    "sn": "Shona",
+    "ki": "Gikuyu (Kikuyu)",
+    "luo": "Dholuo",
+    "kam": "Kikamba",
+    "guz": "Ekegusii (Kisii/Gusii)",
+    "mer": "Kimeru (Meru)",
 }
+
+SUPPORTED_LANG_CODES = set(LANGS.keys())
 
 
 # ----------------------------
-# DEPARTMENTS (CATEGORIES)
+# DEPARTMENTS
 # ----------------------------
 DEPARTMENTS = [
     "ACCOUNT", "ATM", "CARD", "CONTACT", "FEES",
@@ -81,12 +89,12 @@ DEPT_LABELS = {
     "TRANSFER": "Payments & Transfers"
 }
 
-# Tiny, local dummy routing bank (rule-based + TF-IDF)
+# Router training samples (English)
 DEPT_TRAIN = {
     "ACCOUNT": [
         "open account", "create account", "close account", "account frozen",
         "recent transactions", "bank statement", "account verification", "kyc update",
-        "check balance", "account balance"
+        "check balance", "account balance", "account statement"
     ],
     "ATM": [
         "atm swallowed my card", "no cash but debited", "failed withdrawal",
@@ -100,17 +108,18 @@ DEPT_TRAIN = {
         "customer care", "speak to agent", "human agent", "call center", "contact support"
     ],
     "FEES": [
-        "charges too high", "check fees", "annual charges", "fee dispute"
+        "charges too high", "check fees", "fee dispute", "pricing", "charges"
     ],
     "FIND": [
         "find atm", "nearest atm", "find branch", "branch near me"
     ],
     "LOAN": [
-        "apply for loan", "loan repayment", "mortgage", "cancel loan",
-        "loan status", "interest rate", "borrow money"
+        "apply for loan", "loan repayment", "loan status", "interest rate",
+        "borrow money", "take a loan", "get a loan"
     ],
     "PASSWORD": [
-        "reset password", "forgot password", "set up password", "login problem"
+        "reset password", "forgot password", "set up password", "login problem",
+        "reset pin", "forgot pin"
     ],
     "TRANSFER": [
         "cancel transfer", "make transfer", "wrong transfer", "pending transfer",
@@ -119,41 +128,373 @@ DEPT_TRAIN = {
 }
 
 DEPT_KEYWORDS = {
-    "ATM": ["atm", "cash withdrawal", "swallowed", "debit but no cash"],
+    "ATM": ["atm", "withdrawal", "no cash", "swallowed", "debited"],
     "CARD": ["card", "visa", "mastercard", "debit card", "credit card"],
-    "LOAN": ["loan", "mortgage", "repayment", "interest", "borrow"],
+    "LOAN": ["loan", "borrow", "interest", "repayment", "mortgage"],
     "TRANSFER": ["transfer", "send money", "reversal", "pending", "reverse transaction"],
-    "PASSWORD": ["password", "pin reset", "forgot", "login problem"],
-    "FEES": ["fees", "charges", "annual fee", "pricing"],
-    "FIND": ["find atm", "branch", "nearest atm", "locator"],
+    "PASSWORD": ["password", "pin", "reset", "forgot", "login problem"],
+    "FEES": ["fees", "charges", "pricing", "annual fee"],
+    "FIND": ["find atm", "nearest atm", "branch", "locator"],
     "CONTACT": ["agent", "customer care", "call center", "contact support"],
-    "ACCOUNT": ["account", "statement", "transactions", "close account", "balance"]
+    "ACCOUNT": ["account", "statement", "transactions", "balance", "kyc"]
 }
 
 
 # ----------------------------
-# SAFE INDEX HELPER
+# MODERN LIGHT UI (No big “box containers”)
 # ----------------------------
-def safe_index(options, value, fallback_value=None):
-    if value is None:
-        value_norm = ""
-    else:
-        value_norm = str(value).strip().upper()
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-    options_norm = [str(o).strip().upper() for o in options]
-    if value_norm in options_norm:
-        return options_norm.index(value_norm)
+:root{
+  --bg1:#f7fbff;
+  --bg2:#fbf7ff;
+  --ink:#0a1020;
+  --muted:#56607a;
+  --line:rgba(15,23,42,0.10);
 
-    if fallback_value is not None:
-        fallback_norm = str(fallback_value).strip().upper()
-        if fallback_norm in options_norm:
-            return options_norm.index(fallback_norm)
+  --p1:#5b7cfa;
+  --p2:#7c3aed;
+  --p3:#22c55e;
+  --p4:#06b6d4;
+  --warn:#f59e0b;
+  --danger:#ef4444;
 
-    return 0
+  --r:18px;
+  --shadow: 0 18px 50px rgba(15,23,42,0.12);
+  --shadow2: 0 10px 25px rgba(15,23,42,0.08);
+}
+
+#MainMenu, footer, header {visibility: hidden;}
+[data-testid="stToolbar"] {display:none !important;}
+[data-testid="stDecoration"] {display:none !important;}
+
+html, body, [data-testid="stAppViewContainer"]{
+  font-family: "Plus Jakarta Sans", system-ui, -apple-system, Segoe UI, Roboto, sans-serif !important;
+  color: var(--ink) !important;
+  background:
+    radial-gradient(1000px 700px at 12% 5%, rgba(91,124,250,0.20), transparent 60%),
+    radial-gradient(900px 650px at 92% 12%, rgba(124,58,237,0.16), transparent 55%),
+    radial-gradient(900px 650px at 50% 105%, rgba(34,197,94,0.12), transparent 52%),
+    linear-gradient(180deg, var(--bg1), var(--bg2)) !important;
+}
+
+.block-container{
+  max-width: 1200px;
+  padding-top: 1.2rem !important;
+  padding-bottom: 1.6rem !important;
+}
+
+h1,h2,h3{
+  letter-spacing: -0.03em;
+}
+h1{ font-weight: 800; }
+h2{ font-weight: 800; }
+h3{ font-weight: 800; }
+p{ color: var(--muted); }
+
+.hr{
+  height:1px; background: var(--line); border:none; margin: 14px 0;
+}
+
+.pillbar{
+  display:flex; gap:10px; flex-wrap:wrap;
+  padding:8px 0 6px 0;
+}
+
+.pill{
+  display:inline-flex; align-items:center; gap:8px;
+  padding:8px 12px; border-radius:999px;
+  border:1px solid rgba(15,23,42,0.10);
+  background: rgba(255,255,255,0.55);
+  box-shadow: var(--shadow2);
+  font-weight: 650;
+  color: rgba(10,16,32,0.88);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+.pill:hover{ transform: translateY(-1px); box-shadow: 0 16px 35px rgba(15,23,42,0.10); }
+
+.primary-btn button{
+  border: 1px solid rgba(91,124,250,0.25) !important;
+  background: linear-gradient(135deg, var(--p1), var(--p2)) !important;
+  color: #fff !important;
+  font-weight: 800 !important;
+  border-radius: 14px !important;
+  padding: 0.72rem 1.05rem !important;
+  box-shadow: 0 16px 30px rgba(91,124,250,0.22) !important;
+  transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease !important;
+}
+.primary-btn button:hover{
+  transform: translateY(-1px);
+  box-shadow: 0 20px 40px rgba(91,124,250,0.26) !important;
+  filter: saturate(1.05);
+}
+
+.stTextInput input, .stTextArea textarea, .stSelectbox select{
+  border-radius: 14px !important;
+  border: 1px solid rgba(15,23,42,0.14) !important;
+  background: rgba(255,255,255,0.74) !important;
+  box-shadow: var(--shadow2);
+}
+
+label{ font-weight: 750 !important; }
+
+.hero{
+  display:flex; justify-content:space-between; align-items:flex-end; gap:18px;
+  padding: 8px 0 2px 0;
+}
+.hero .subtitle{
+  color: var(--muted);
+  font-size: 1.02rem;
+  line-height: 1.5;
+}
+
+.login-wrap{
+  margin-top: 16px;
+  display:grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 22px;
+}
+@media (max-width: 900px){
+  .login-wrap{ grid-template-columns: 1fr; }
+}
+
+.soft-panel{
+  background: rgba(255,255,255,0.55);
+  border: 1px solid rgba(15,23,42,0.10);
+  border-radius: var(--r);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+}
+
+.mini{
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+kbd{
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(15,23,42,0.10);
+  background: rgba(255,255,255,0.65);
+  box-shadow: var(--shadow2);
+  font-weight: 700;
+  color: rgba(10,16,32,0.92);
+}
+
+[data-testid="stChatMessage"]{
+  border-radius: 16px;
+  border: 1px solid rgba(15,23,42,0.08);
+  background: rgba(255,255,255,0.68);
+  box-shadow: var(--shadow2);
+  padding: 12px 12px;
+}
+
+[data-testid="stChatMessage"] *{
+  color: rgba(10,16,32,0.94) !important;
+}
+
+.chat-drawer-hint{
+  color: var(--muted);
+  font-size: 0.95rem;
+  margin-top: -6px;
+}
+
+.stTabs [data-baseweb="tab"]{
+  border-radius: 999px !important;
+  padding: 10px 14px !important;
+  border: 1px solid rgba(15,23,42,0.10) !important;
+  background: rgba(255,255,255,0.55) !important;
+  font-weight: 800 !important;
+}
+.stTabs [aria-selected="true"]{
+  background: linear-gradient(135deg, rgba(91,124,250,0.16), rgba(124,58,237,0.12)) !important;
+  border-color: rgba(91,124,250,0.25) !important;
+}
+
+[data-testid="stDataFrame"]{
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid rgba(15,23,42,0.10);
+  box-shadow: var(--shadow);
+}
+</style>
+"""
 
 
 # ----------------------------
-# PASSWORD HASHING (stdlib PBKDF2)
+# OPENAI CLIENT
+# ----------------------------
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        return None
+
+
+# ----------------------------
+# PLACEHOLDER PROTECTION
+# ----------------------------
+_PLACEHOLDER_RE = re.compile(r"(\{\{[^{}]*\}\}|\{[^{}]*\}|<[^<>]*>)")
+
+def protect_placeholders(text: str):
+    mapping = {}
+    def repl(m):
+        key = f"@@PH{len(mapping)}@@"
+        mapping[key] = m.group(0)
+        return key
+    return _PLACEHOLDER_RE.sub(repl, text), mapping
+
+def restore_placeholders(text: str, mapping: dict):
+    out = text
+    for k in sorted(mapping.keys(), key=len, reverse=True):
+        out = out.replace(k, mapping[k])
+    return out
+
+
+def _safe_json_parse(s: str) -> Optional[dict]:
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        # try to extract first json object
+        try:
+            i = s.find("{")
+            j = s.rfind("}")
+            if i >= 0 and j > i:
+                return json.loads(s[i:j+1])
+        except Exception:
+            return None
+    return None
+
+
+# ----------------------------
+# MULTILINGUAL: detect + translate to English + translate back
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def detect_and_translate_to_english(user_text: str) -> Tuple[str, str]:
+    """
+    Returns (lang_code, english_text).
+    If key missing: returns ('en', original_text).
+    """
+    client = get_openai_client()
+    if not client:
+        return "en", user_text
+
+    protected, mapping = protect_placeholders(user_text)
+
+    system = (
+        "You are a language detector + translator.\n"
+        "Return ONLY valid JSON: {\"lang\": \"...\", \"english\": \"...\"}\n"
+        "lang MUST be one of: " + ", ".join(sorted(SUPPORTED_LANG_CODES)) + "\n"
+        "Translate the INPUT into English.\n"
+        "Preserve placeholders exactly (tokens like @@PH0@@)."
+    )
+
+    try:
+        resp = client.responses.create(
+            model=TRANSLATION_MODEL,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"INPUT:\n{protected}"}
+            ],
+            temperature=0
+        )
+        raw = (resp.output_text or "").strip()
+        data = _safe_json_parse(raw) or {}
+        lang = str(data.get("lang", "en")).strip().lower()
+        eng = str(data.get("english", protected))
+
+        if lang not in SUPPORTED_LANG_CODES:
+            lang = "en"
+
+        eng = restore_placeholders(eng, mapping)
+        return lang, eng
+
+    except Exception:
+        return "en", user_text
+
+
+@st.cache_data(show_spinner=False)
+def translate_from_english(text_en: str, target_lang: str) -> str:
+    if target_lang == "en":
+        return text_en
+
+    client = get_openai_client()
+    if not client:
+        return text_en
+
+    protected, mapping = protect_placeholders(text_en)
+
+    system = (
+        "You are a professional translator.\n"
+        f"Translate from English to {LANGS.get(target_lang, target_lang)}.\n"
+        "Rules:\n"
+        "- Output ONLY the translation.\n"
+        "- Preserve placeholders exactly (tokens like @@PH0@@).\n"
+        "- Keep numbers/currency/product names unchanged.\n"
+        "- Natural, fluent, not robotic."
+    )
+
+    try:
+        resp = client.responses.create(
+            model=TRANSLATION_MODEL,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": protected}
+            ],
+            temperature=0
+        )
+        out = (resp.output_text or "").strip()
+        out = restore_placeholders(out, mapping)
+        return out
+    except Exception:
+        return text_en
+
+
+def handle_language_command(user_text: str):
+    """
+    Sets preferred language if user says stuff like:
+      - jibu kwa kiswahili
+      - reply in amharic
+      - somali / arabic / shona / kikuyu / dholuo / kamba / kisii / meru
+    """
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False, None, None
+
+    name_to_code = {
+        "english": "en",
+        "kiswahili": "sw", "swahili": "sw",
+        "amharic": "am", "አማርኛ": "am",
+        "somali": "so", "soomaali": "so",
+        "arabic": "ar", "العربية": "ar", "عربي": "ar",
+        "shona": "sn",
+        "kikuyu": "ki", "gikuyu": "ki",
+        "dholuo": "luo", "luo": "luo",
+        "kamba": "kam", "kikamba": "kam",
+        "kisii": "guz", "ekegusii": "guz", "gusii": "guz",
+        "meru": "mer", "kimeru": "mer",
+    }
+
+    for k, code in name_to_code.items():
+        if k in t:
+            msg_en = f"Okay — I’ll reply in {LANGS.get(code, code)} from now on."
+            msg = translate_from_english(msg_en, code)
+            return True, msg, code
+
+    return False, None, None
+
+
+# ----------------------------
+# PASSWORD HASHING (PBKDF2)
 # ----------------------------
 def hash_password(password: str, salt: bytes = None) -> str:
     if salt is None:
@@ -189,450 +530,7 @@ def verify_password(password: str, stored) -> bool:
 
 
 # ----------------------------
-# MODERN LIGHT UI STYLING (NEW)
-# ----------------------------
-BANK_CSS = """
-<style>
-/* Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
-/* Theme tokens */
-:root{
-  --bg: #f6f8ff;
-  --bg2:#f8fbff;
-  --card: rgba(255,255,255,0.86);
-  --card2: rgba(255,255,255,0.72);
-  --stroke: rgba(18, 24, 40, 0.10);
-  --stroke2: rgba(18, 24, 40, 0.14);
-  --text:#0b1220;
-  --muted:#556079;
-  --muted2:#6b7280;
-
-  --primary:#5b7cfa;
-  --primary2:#22c55e;
-  --accent:#7c3aed;
-  --warn:#f59e0b;
-  --danger:#ef4444;
-
-  --shadow: 0 16px 40px rgba(16,24,40,0.12);
-  --shadow2: 0 10px 24px rgba(16,24,40,0.10);
-  --radius: 18px;
-  --radius2: 14px;
-}
-
-/* Kill Streamlit chrome */
-#MainMenu, footer, header {visibility: hidden;}
-[data-testid="stToolbar"] {display:none !important;}
-[data-testid="stDecoration"] {display:none !important;}
-
-html, body, [data-testid="stAppViewContainer"]{
-  font-family: "Plus Jakarta Sans", Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif !important;
-  background: radial-gradient(1100px 800px at 8% 0%, rgba(91,124,250,0.18), transparent 60%),
-              radial-gradient(1000px 700px at 92% 10%, rgba(124,58,237,0.14), transparent 55%),
-              radial-gradient(900px 650px at 50% 100%, rgba(34,197,94,0.10), transparent 50%),
-              linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%) !important;
-  color: var(--text) !important;
-}
-
-/* Global spacing */
-.block-container{
-  padding-top: 1.1rem !important;
-  padding-bottom: 1.4rem !important;
-  max-width: 1200px;
-}
-
-/* Subtle animated background glows */
-@keyframes floaty {
-  0% { transform: translateY(0px) translateX(0px); filter: blur(0px); }
-  50% { transform: translateY(-10px) translateX(8px); filter: blur(0.2px); }
-  100% { transform: translateY(0px) translateX(0px); filter: blur(0px); }
-}
-.bg-orb{
-  position: fixed;
-  z-index: 0;
-  width: 340px;
-  height: 340px;
-  border-radius: 999px;
-  filter: blur(40px);
-  opacity: 0.55;
-  animation: floaty 7s ease-in-out infinite;
-  pointer-events: none;
-}
-.bg-orb.one{ left: -120px; top:-120px; background: rgba(91,124,250,0.28); }
-.bg-orb.two{ right: -120px; top: 120px; background: rgba(124,58,237,0.22); animation-duration: 9s; }
-.bg-orb.three{ left: 35%; bottom: -160px; background: rgba(34,197,94,0.18); animation-duration: 11s; }
-
-/* Card */
-.bank-card{
-  position: relative;
-  z-index: 1;
-  background: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.78) 100%);
-  border: 1px solid var(--stroke);
-  border-radius: var(--radius);
-  padding: 18px 18px;
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  overflow: hidden;
-  animation: fadeUp 240ms ease-out both;
-}
-@keyframes fadeUp{
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0px); }
-}
-
-/* Nice header "chip" / badge */
-.badge{
-  display:inline-flex;
-  gap:8px;
-  align-items:center;
-  padding:6px 12px;
-  border-radius: 999px;
-  font-size: 12.5px;
-  font-weight: 650;
-  color: #1f2a44;
-  background: rgba(91,124,250,0.12);
-  border: 1px solid rgba(91,124,250,0.20);
-  box-shadow: 0 6px 16px rgba(91,124,250,0.08);
-}
-.badge-ok{ background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.20); }
-.badge-warn{ background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.22); }
-
-.small-muted{
-  color: var(--muted);
-  font-size: 0.95rem;
-  line-height: 1.5;
-}
-
-/* Titles */
-h1,h2,h3,h4{
-  letter-spacing: -0.02em;
-}
-h2{ font-weight: 750; }
-h3{ font-weight: 750; }
-a, a:visited{ color: var(--primary); }
-
-/* Buttons (all) */
-.stButton button, button[kind="primary"]{
-  border: 1px solid rgba(91,124,250,0.25) !important;
-  background: linear-gradient(135deg, rgba(91,124,250,0.98) 0%, rgba(124,58,237,0.94) 100%) !important;
-  color: white !important;
-  font-weight: 700 !important;
-  border-radius: 14px !important;
-  padding: 0.68rem 1.05rem !important;
-  box-shadow: 0 12px 22px rgba(91,124,250,0.22) !important;
-  transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease !important;
-}
-.stButton button:hover{
-  transform: translateY(-1px) scale(1.01);
-  box-shadow: 0 16px 30px rgba(91,124,250,0.28) !important;
-  filter: saturate(1.05);
-}
-.stButton button:active{
-  transform: translateY(0px) scale(0.99);
-  box-shadow: 0 10px 18px rgba(91,124,250,0.18) !important;
-}
-
-/* Secondary buttons: Streamlit sometimes renders different kinds */
-button[kind="secondary"], .stButton button[kind="secondary"]{
-  background: rgba(255,255,255,0.72) !important;
-  color: var(--text) !important;
-  border: 1px solid var(--stroke2) !important;
-  box-shadow: var(--shadow2) !important;
-}
-
-/* Inputs */
-label{ color: #111827 !important; font-weight: 650 !important; }
-.stTextInput input, .stTextArea textarea, .stSelectbox select, .stMultiSelect div, .stNumberInput input{
-  background: rgba(255,255,255,0.88) !important;
-  border: 1px solid var(--stroke2) !important;
-  color: var(--text) !important;
-  border-radius: 14px !important;
-  box-shadow: 0 10px 20px rgba(16,24,40,0.06);
-  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
-}
-.stTextInput input:focus, .stTextArea textarea:focus, .stSelectbox select:focus{
-  border-color: rgba(91,124,250,0.55) !important;
-  box-shadow: 0 14px 26px rgba(91,124,250,0.14) !important;
-}
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"]{
-  gap: 10px;
-}
-.stTabs [data-baseweb="tab"]{
-  border-radius: 999px !important;
-  border: 1px solid var(--stroke2) !important;
-  background: rgba(255,255,255,0.66) !important;
-  padding: 10px 14px !important;
-  font-weight: 700 !important;
-  color: #24324a !important;
-  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
-}
-.stTabs [aria-selected="true"]{
-  background: linear-gradient(135deg, rgba(91,124,250,0.16) 0%, rgba(124,58,237,0.12) 100%) !important;
-  border-color: rgba(91,124,250,0.30) !important;
-  box-shadow: 0 12px 22px rgba(91,124,250,0.10);
-  transform: translateY(-1px);
-}
-
-/* Dataframes / tables */
-[data-testid="stDataFrame"]{
-  border-radius: 16px;
-  overflow: hidden;
-  border: 1px solid var(--stroke);
-  box-shadow: 0 16px 30px rgba(16,24,40,0.10);
-}
-[data-testid="stTable"]{
-  border-radius: 16px;
-  overflow: hidden;
-}
-
-/* Chat container */
-.chat-wrap{
-  position: relative;
-  z-index: 1;
-  background: rgba(255,255,255,0.78);
-  border: 1px solid var(--stroke);
-  border-radius: var(--radius);
-  padding: 12px;
-  max-height: 60vh;
-  min-height: 200px;
-  overflow-y: auto;
-  box-shadow: var(--shadow2);
-}
-
-/* Nice scrollbar */
-.chat-wrap::-webkit-scrollbar{ width: 10px; }
-.chat-wrap::-webkit-scrollbar-track{ background: rgba(17,24,39,0.06); border-radius: 999px;}
-.chat-wrap::-webkit-scrollbar-thumb{
-  background: rgba(91,124,250,0.25);
-  border-radius: 999px;
-  border: 2px solid rgba(255,255,255,0.55);
-}
-.chat-wrap::-webkit-scrollbar-thumb:hover{ background: rgba(91,124,250,0.35); }
-
-/* Chat bubbles */
-.bubble{
-  width: fit-content;
-  max-width: 78%;
-  padding: 10px 12px;
-  border-radius: 16px;
-  margin: 8px 0;
-  line-height: 1.55;
-  font-size: 0.98rem;
-  white-space: pre-wrap;
-  animation: popIn 140ms ease-out both;
-}
-@keyframes popIn{
-  from{ opacity:0; transform: translateY(4px) scale(0.985); }
-  to{ opacity:1; transform: translateY(0px) scale(1); }
-}
-.user{
-  margin-left: auto;
-  background: linear-gradient(135deg, rgba(91,124,250,0.18) 0%, rgba(124,58,237,0.12) 100%);
-  border: 1px solid rgba(91,124,250,0.22);
-}
-.bot{
-  margin-right: auto;
-  background: rgba(255,255,255,0.88);
-  border: 1px solid var(--stroke2);
-}
-
-/* Ticket panel */
-.ticket{
-  background: rgba(255,255,255,0.80);
-  border: 1px dashed rgba(91,124,250,0.35);
-  border-radius: 16px;
-  padding: 12px 14px;
-  margin-top: 10px;
-  box-shadow: 0 16px 26px rgba(91,124,250,0.10);
-}
-
-/* Input card */
-.input-card{
-  position: relative;
-  z-index: 1;
-  background: rgba(255,255,255,0.78);
-  border: 1px solid var(--stroke);
-  border-radius: var(--radius);
-  padding: 12px 12px;
-  box-shadow: var(--shadow2);
-}
-
-/* Reduce horizontal rules */
-hr{
-  border: none;
-  border-top: 1px solid rgba(17,24,39,0.10);
-  margin: 12px 0;
-}
-
-/* Alerts: make them look cleaner */
-[data-testid="stAlert"]{
-  border-radius: 16px !important;
-  border: 1px solid rgba(17,24,39,0.10) !important;
-  box-shadow: 0 14px 26px rgba(16,24,40,0.08) !important;
-}
-
-/* Mobile */
-@media (max-width: 720px){
-  .block-container{ padding: 0.8rem 0.8rem 1.2rem 0.8rem !important; }
-  .bubble{ max-width: 90%; }
-}
-</style>
-
-<div class="bg-orb one"></div>
-<div class="bg-orb two"></div>
-<div class="bg-orb three"></div>
-"""
-
-
-# ----------------------------
-# OPENAI CLIENT (API KEY ONLY)
-# ----------------------------
-def get_openai_client():
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        from openai import OpenAI
-        return OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        return None
-
-
-# ----------------------------
-# PLACEHOLDER PROTECTION (so templates like {amount} don't get translated)
-# ----------------------------
-_PLACEHOLDER_RE = re.compile(r"(\{\{[^{}]*\}\}|\{[^{}]*\}|<[^<>]*>)")
-
-def protect_placeholders(text: str):
-    mapping = {}
-    def repl(m):
-        key = f"@@PH{len(mapping)}@@"
-        mapping[key] = m.group(0)
-        return key
-    return _PLACEHOLDER_RE.sub(repl, text), mapping
-
-def restore_placeholders(text: str, mapping: dict):
-    out = text
-    for k in sorted(mapping.keys(), key=len, reverse=True):
-        out = out.replace(k, mapping[k])
-    return out
-
-
-# ----------------------------
-# LANGUAGE: detect + translate to English + translate back
-# ----------------------------
-def detect_and_translate_to_english(user_text: str):
-    """
-    Returns: (detected_lang_code, english_text)
-    detected_lang_code in: en, sw, am, so, ar (fallback: en)
-    """
-    client = get_openai_client()
-    if not client:
-        return "en", user_text
-
-    protected, mapping = protect_placeholders(user_text)
-
-    system = (
-        "You are a language detector and translator.\n"
-        "Task:\n"
-        "1) Detect the language of the INPUT.\n"
-        "2) Translate the INPUT to English.\n\n"
-        "Return ONLY valid JSON with keys: lang, english.\n"
-        "lang must be one of: en, sw, am, so, ar.\n"
-        "Preserve any placeholders exactly (tokens like @@PH0@@). Do NOT change them."
-    )
-    user = f"INPUT:\n{protected}"
-
-    try:
-        resp = client.responses.create(
-            model=TRANSLATION_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0
-        )
-        raw = (resp.output_text or "").strip()
-        data = json.loads(raw)
-
-        lang = str(data.get("lang", "en")).strip().lower()
-        eng = str(data.get("english", protected))
-
-        if lang not in ("en", "sw", "am", "so", "ar"):
-            lang = "en"
-
-        eng = restore_placeholders(eng, mapping)
-        return lang, eng
-    except Exception:
-        return "en", user_text
-
-
-def translate_from_english(text_en: str, target_lang: str):
-    if target_lang == "en":
-        return text_en
-
-    client = get_openai_client()
-    if not client:
-        return text_en
-
-    protected, mapping = protect_placeholders(text_en)
-
-    system = (
-        "You are a professional translator.\n"
-        f"Translate from English to {LANG_NAME.get(target_lang, target_lang)}.\n"
-        "Rules:\n"
-        "- Output ONLY the translation, no explanations.\n"
-        "- Preserve placeholders exactly (tokens like @@PH0@@). Do NOT change them.\n"
-        "- Keep numbers, currency, and product names unchanged unless the target language normally uses a different script."
-    )
-
-    try:
-        resp = client.responses.create(
-            model=TRANSLATION_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": protected},
-            ],
-            temperature=0
-        )
-        out = (resp.output_text or "").strip()
-        out = restore_placeholders(out, mapping)
-        return out
-    except Exception:
-        return text_en
-
-
-def handle_language_command(user_text: str):
-    """
-    Optional explicit commands:
-      - "jibu kwa kiswahili"
-      - "reply in amharic"
-      - "somali"
-      - "arabic"
-      - "english"
-    """
-    t = str(user_text).strip().lower()
-    if not t:
-        return False, None, None
-
-    if "kiswahili" in t or "swahili" in t:
-        return True, "Sawa—nitajibu kwa Kiswahili kuanzia sasa.", "sw"
-    if "amharic" in t or "አማርኛ" in user_text:
-        return True, "እሺ — ከአሁን በኋላ በአማርኛ እመልሳለሁ።", "am"
-    if "somali" in t or "soomaali" in t:
-        return True, "Haye—laga bilaabo hadda waxaan ku jawaabi doonaa Af-Soomaali.", "so"
-    if "arabic" in t or "العربية" in user_text or "عربي" in user_text:
-        return True, "حسنًا — سأجيب بالعربية من الآن فصاعدًا.", "ar"
-    if "english" in t:
-        return True, "Okay—I'll reply in English from now on.", "en"
-
-    return False, None, None
-
-
-# ----------------------------
-# DB HELPERS + MIGRATIONS
+# DB HELPERS
 # ----------------------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -647,7 +545,6 @@ def seed_or_upgrade_user(c, username, password, role):
     c.execute("SELECT pw_hash FROM users WHERE username=?", (username,))
     row = c.fetchone()
     new_hash = hash_password(password)
-
     if not row:
         c.execute(
             "INSERT INTO users(username,pw_hash,role) VALUES(?,?,?)",
@@ -676,7 +573,7 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS custom_faqs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        department TEXT DEFAULT 'GENERAL',
+        department TEXT DEFAULT 'CONTACT',
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         tags TEXT,
@@ -684,9 +581,6 @@ def init_db():
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """)
-
-    if not column_exists(conn, "custom_faqs", "department"):
-        c.execute("ALTER TABLE custom_faqs ADD COLUMN department TEXT DEFAULT 'GENERAL'")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS complaints(
@@ -719,10 +613,8 @@ def init_db():
     if not column_exists(conn, "chat_logs", "department"):
         c.execute("ALTER TABLE chat_logs ADD COLUMN department TEXT")
 
-    c.execute("UPDATE custom_faqs SET department='CONTACT' WHERE UPPER(department)='GENERAL'")
-
     seed_or_upgrade_user(c, "admin", "admin123", "admin")
-    seed_or_upgrade_user(c, "user",  "user123",  "user")
+    seed_or_upgrade_user(c, "user", "user123", "user")
 
     conn.commit()
     conn.close()
@@ -839,7 +731,7 @@ def update_complaint(cid, status=None, priority=None, internal_notes=None):
 
 
 # ----------------------------
-# DATASET LOADING
+# HF DATASET LOADING
 # ----------------------------
 @st.cache_resource(show_spinner=False)
 def load_base_dataset():
@@ -869,14 +761,11 @@ def load_base_dataset():
     else:
         base_df["category"] = "CONTACT"
 
-    if intentcol:
-        base_df["intent"] = df[intentcol].astype(str)
-    else:
-        base_df["intent"] = ""
-
+    base_df["intent"] = df[intentcol].astype(str) if intentcol else ""
     base_df.dropna(inplace=True)
     base_df.reset_index(drop=True, inplace=True)
     return base_df
+
 
 @st.cache_resource(show_spinner=False)
 def build_vector_index(texts):
@@ -899,8 +788,7 @@ def normalize(text):
 
 @st.cache_resource(show_spinner=False)
 def build_dept_router():
-    dept_texts = []
-    dept_labels = []
+    dept_texts, dept_labels = [], []
     for d, samples in DEPT_TRAIN.items():
         for s in samples:
             dept_texts.append(s)
@@ -964,6 +852,7 @@ def answer_from_base(query_en, dept, base_df):
         return best["answer"], float(best["score"]), "base"
     return None
 
+
 def openai_fallback(query_en, context_snippets, out_lang="en"):
     client = get_openai_client()
     if not client:
@@ -974,13 +863,14 @@ def openai_fallback(query_en, context_snippets, out_lang="en"):
             "Your name is Baraka. "
             "You are a helpful Kenyan retail-banking & SACCO support assistant. "
             "Answer ONLY using the provided context. "
-            "If context is insufficient, ask a short follow-up question. "
-            "Never request PINs or passwords. "
-            f"Reply in {LANG_NAME.get(out_lang, 'English')}."
+            "If context is insufficient, ask one short follow-up question. "
+            "Never request PINs, passwords, or OTPs. "
+            f"Reply in {LANGS.get(out_lang, 'English')}."
         )
+
         user = (
             f"Customer question (English): {query_en}\n\n"
-            "Context (FAQ snippets, English):\n" + "\n---\n".join(context_snippets)
+            "Context (FAQ snippets):\n" + "\n---\n".join(context_snippets)
         )
 
         resp = client.responses.create(
@@ -993,9 +883,10 @@ def openai_fallback(query_en, context_snippets, out_lang="en"):
         )
         return (resp.output_text or "").strip(), 0.0, "openai"
     except Exception:
-        return ("AI fallback is unavailable right now. I’ll answer using SACCO FAQs.", 0.0, "fallback")
+        return ("AI fallback is unavailable right now.", 0.0, "fallback")
 
-def generate_reply(user_message_raw, query_en, username, dept, out_lang):
+
+def generate_reply(user_message_raw: str, query_en: str, username: str, dept: str, out_lang: str):
     base_df = load_base_dataset()
 
     custom_hit = answer_from_custom_first(query_en, dept)
@@ -1022,56 +913,93 @@ def generate_reply(user_message_raw, query_en, username, dept, out_lang):
 
 
 # ----------------------------
-# UI PAGES
+# UI HELPERS
 # ----------------------------
-def render_brand_header(title, subtitle, badge_text="Baraka"):
-    st.markdown(BANK_CSS, unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="bank-card" style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start;">
-      <div style="min-width:60%;">
-        <h2 style="margin:0;line-height:1.1;">{title}</h2>
-        <div class="small-muted" style="margin-top:8px;">{subtitle}</div>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:10px;align-items:flex-end;">
-        <span class="badge">{badge_text}</span>
-        <span class="badge badge-ok">Modern • Light UI</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def login_page():
-    render_brand_header(
-        title=f"{APP_NAME}",
-        subtitle="Sign in to submit complaints, get routed to the right department, and chat with a support bot.",
-        badge_text="Kenya-ready"
-    )
-
-    left, right = st.columns([1.2, 1.0], vertical_alignment="top")
-
-    with left:
-        st.markdown("""
-        <div class="bank-card">
-          <h3 style="margin:0;">Welcome back ✨</h3>
-          <div class="small-muted" style="margin-top:8px;">
-            Demo accounts:<br>
-            <b>admin / admin123</b><br>
-            <b>user / user123</b>
+def top_hero(title: str, subtitle: str):
+    st.markdown(THEME_CSS, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="hero">
+          <div>
+            <h1 style="margin:0;">{title}</h1>
+            <div class="subtitle">{subtitle}</div>
           </div>
-          <hr/>
-          <div class="small-muted">
-            Tip: You can chat in <b>Swahili, Amharic, Somali</b> or <b>Arabic</b>.
-            Baraka will auto-detect and reply in the same language.
+          <div class="pillbar">
+            <div class="pill">✨ Light UI</div>
+            <div class="pill">🌍 Multilingual</div>
+            <div class="pill">🧠 Smart routing</div>
           </div>
         </div>
-        """, unsafe_allow_html=True)
+        <div class="hr"></div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def nav_bar(role: str):
+    # Simple clean nav (no ugly boxes)
+    pages_user = [("Home", "home"), ("Complaint", "complaint"), ("Chat", "chat")]
+    pages_admin = [("Admin", "admin")]
+    pages = pages_admin if role == "admin" else pages_user
+
+    cols = st.columns(len(pages) + 1)
+    for i, (label, key) in enumerate(pages):
+        with cols[i]:
+            if st.button(label, use_container_width=True):
+                st.session_state.page = key
+                st.rerun()
+    with cols[-1]:
+        if st.button("Logout", use_container_width=True):
+            for k in ["user", "role", "page", "messages", "active_ticket", "preferred_lang"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+def require_api_key_banner():
+    if not OPENAI_API_KEY:
+        st.warning("Set OPENAI_API_KEY to enable multilingual translation + AI fallback.")
+
+
+# ----------------------------
+# PAGES
+# ----------------------------
+def login_page():
+    top_hero(APP_NAME, "Sign in, submit complaints, and chat with Baraka — your multilingual support assistant.")
+    require_api_key_banner()
+
+    st.markdown('<div class="login-wrap">', unsafe_allow_html=True)
+    left, right = st.columns([1.15, 1.0])
+
+    with left:
+        st.markdown(
+            """
+            <div class="soft-panel">
+              <h3 style="margin:0;">Welcome back</h3>
+              <div class="mini" style="margin-top:10px;">
+                Demo logins:
+                <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+                  <kbd>admin / admin123</kbd>
+                  <kbd>user / user123</kbd>
+                </div>
+              </div>
+              <div class="hr"></div>
+              <div class="mini">
+                Baraka auto-detects your language and replies in the same one.<br/>
+                Supported: Swahili, Amharic, Somali, Arabic, Shona, Kikuyu, Dholuo, Kamba, Kisii, Meru.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     with right:
-        st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
+        st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
         st.markdown("### Sign in")
-        with st.form("login"):
+        with st.form("login_form"):
             username = st.text_input("Username", placeholder="e.g., admin")
             password = st.text_input("Password", type="password", placeholder="••••••••")
+            st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
             submitted = st.form_submit_button("Login")
+            st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
             role = verify_user(username, password)
@@ -1084,255 +1012,139 @@ def login_page():
                 st.error("Invalid username/password.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    if not OPENAI_API_KEY:
-        st.warning("OPENAI_API_KEY is not set. Multilingual auto-translation and AI fallback need the API key.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 def user_home_page():
-    user = st.session_state.user
-    render_brand_header(
-        title=f"Hello, {user}",
-        subtitle="Choose what you want to do today.",
-        badge_text="Customer Portal"
-    )
+    top_hero("Customer Portal", "Pick what you want to do. The chatbot can be opened from the chat drawer.")
+    nav_bar("user")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("### 📝 Submit a Complaint / Inquiry")
-        st.markdown("<div class='small-muted'>Your complaint will be routed automatically.</div>", unsafe_allow_html=True)
-        if st.button("Open Complaint Form"):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
+        st.markdown("### 📝 Submit a complaint")
+        st.write("Describe your issue, Baraka routes it automatically, and you get an instant reply.")
+        st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
+        if st.button("Open Complaint Form", use_container_width=True):
             st.session_state.page = "complaint"; st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("### 💬 Chat with Baraka")
-        st.markdown("<div class='small-muted'>Ask questions and get instant help.</div>", unsafe_allow_html=True)
-        if st.button("Open Chat"):
-            st.session_state.page = "chat"; st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
-    if st.button("Logout"):
-        for k in ["user", "role", "page", "messages", "active_ticket", "preferred_lang"]:
-            st.session_state.pop(k, None)
-        st.rerun()
+    with c2:
+        st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
+        st.markdown("### 💬 Chat with Baraka")
+        st.write("Open the chat drawer anytime. You can switch language by saying e.g. “reply in kiswahili”.")
+        st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
+        if st.button("Open Chat", use_container_width=True):
+            st.session_state.page = "chat"; st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    chat_drawer_widget()
+
 
 def complaint_page():
-    user = st.session_state.user
-    render_brand_header(
-        title="Submit Complaint / Inquiry",
-        subtitle="Describe your issue clearly — Baraka will route it automatically and reply instantly.",
-        badge_text="Smart Routing"
-    )
+    top_hero("Submit Complaint", "Write your issue in any supported language. Baraka will route + reply instantly.")
+    nav_bar("user")
+    require_api_key_banner()
 
     with st.form("complaint_form", clear_on_submit=True):
         text = st.text_area("Complaint / Inquiry", height=140,
                             placeholder="e.g., ATM debited me but I got no cash...")
         priority = st.selectbox("Priority", ["Normal", "High", "Urgent"])
+        st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
         submitted = st.form_submit_button("Submit")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if submitted and text.strip():
         if not OPENAI_API_KEY:
-            st.error("OPENAI_API_KEY is not set. Please set your API key to enable multilingual support.")
+            st.error("Please set OPENAI_API_KEY for multilingual support.")
             return
 
         detected_lang, text_en = detect_and_translate_to_english(text.strip())
         out_lang = st.session_state.get("preferred_lang") or detected_lang
 
         dept, score, method = route_department(text_en)
+
         summary = text.strip()[:180] + ("..." if len(text.strip()) > 180 else "")
-        ticket_id = create_complaint(user, text.strip(), dept, priority=priority, summary=summary)
+        ticket_id = create_complaint(st.session_state.user, text.strip(), dept,
+                                     priority=priority, summary=summary)
         st.session_state.active_ticket = ticket_id
 
-        st.success("Complaint submitted successfully.")
-        st.markdown(f"""
-        <div class="ticket">
-          <div><b>Ticket #:</b> {ticket_id}</div>
-          <div><b>Routed Department:</b> {dept} — {DEPT_LABELS.get(dept, dept)}</div>
-          <div><b>Routing Confidence:</b> {score:.2f} ({method})</div>
-          <div class="small-muted" style="margin-top:6px;">
-            An agent can review your case. Baraka will assist below.
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.success(f"Complaint submitted. Ticket #{ticket_id} routed to {dept} ({DEPT_LABELS.get(dept)}).")
 
-        ans, source, sc = generate_reply(text.strip(), text_en, user, dept, out_lang)
-        st.markdown("<hr/>", unsafe_allow_html=True)
-        st.markdown("### Baraka’s Instant Reply")
-        st.markdown(f"<div class='bank-card'>{ans}</div>", unsafe_allow_html=True)
-        st.caption(f"Source: {source} | Similarity: {sc:.2f}")
+        ans, source, sc = generate_reply(text.strip(), text_en, st.session_state.user, dept, out_lang)
+        st.markdown("### Baraka’s Reply")
+        st.write(ans)
+        st.caption(f"Dept: {dept} | Routing: {score:.2f} ({method}) | Source: {source} | Similarity: {sc:.2f}")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Back to Home"):
-            st.session_state.page = "home"; st.rerun()
-    with c2:
-        if st.button("Go to Chat"):
-            st.session_state.page = "chat"; st.rerun()
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+    chat_drawer_widget()
+
 
 def chat_page():
-    user = st.session_state.user
-    render_brand_header(
-        title="Chat with Baraka",
-        subtitle="Ask anything — Baraka will auto-detect your language and reply accordingly.",
-        badge_text="Live Support"
-    )
+    top_hero("Chat", "This is a chatbot drawer — open/close it as needed (not full-screen conversation).")
+    nav_bar("user")
+    require_api_key_banner()
 
-    # Seed welcome message
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if len(st.session_state.messages) == 0:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": (
-                "Hi! 👋 I’m Baraka.\n"
-                "Ask about accounts, cards, loans, ATM issues, transfers, fees — "
-                "or submit a complaint and I’ll route it to the right department.\n\n"
-                "You can write in Kiswahili, Amharic, Somali, Arabic, or English."
-            )
-        })
+    # Big fix: we do NOT render fake HTML wrappers. We use real Streamlit chat components.
+    chat_drawer_widget(expanded_default=True)
 
-    if st.session_state.get("active_ticket"):
-        st.caption(f"Active ticket: #{st.session_state.active_ticket}")
-
-    st.markdown('<div class="chat-wrap">', unsafe_allow_html=True)
-    for m in st.session_state.messages:
-        cls = "user" if m["role"] == "user" else "bot"
-        st.markdown(f'<div class="bubble {cls}">{m["content"]}</div>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="input-card">', unsafe_allow_html=True)
-    with st.form("chat_form", clear_on_submit=True):
-        col1, col2 = st.columns([6, 1])
-        with col1:
-            q = st.text_input("Type your question...", key="user_input", placeholder="e.g., nataka kukopa shilingi elfu kumi")
-        with col2:
-            send = st.form_submit_button("Send")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if send and q.strip():
-        handled, msg, forced = handle_language_command(q.strip())
-        if handled:
-            st.session_state.preferred_lang = forced
-            st.session_state.messages.append({"role": "user", "content": q.strip()})
-            st.session_state.messages.append({"role": "assistant", "content": msg})
-            st.rerun()
-
-        st.session_state.messages.append({"role": "user", "content": q.strip()})
-
-        if not OPENAI_API_KEY:
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "OPENAI_API_KEY is not set. Please set your API key to enable translation + multilingual support."
-            })
-            st.rerun()
-
-        detected_lang, q_en = detect_and_translate_to_english(q.strip())
-        out_lang = st.session_state.get("preferred_lang") or detected_lang
-
-        dept, dscore, dmethod = route_department(q_en)
-        ans, source, score = generate_reply(q.strip(), q_en, user, dept, out_lang)
-
-        if source == "custom":
-            footer = f" Dept FAQ ({dept})"
-        elif source == "base":
-            footer = f" Base dataset ({dept})"
-        elif source == "openai":
-            footer = f" AI fallback ({dept})"
-        else:
-            footer = f" Low confidence ({dept})"
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": (
-                f"{ans}\n\n"
-                f"— Department: {dept} ({DEPT_LABELS.get(dept)}) | "
-                f"Routing: {dscore:.2f} ({dmethod})\n"
-                f"— Source: {footer}"
-            )
-        })
-        st.rerun()
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Back to Home"):
-            st.session_state.page = "home"; st.rerun()
-    with c2:
-        if st.button("Logout"):
-            for k in ["user", "role", "page", "messages", "active_ticket", "preferred_lang"]:
-                st.session_state.pop(k, None)
-            st.rerun()
 
 def admin_page():
-    admin = st.session_state.user
-    render_brand_header(
-        title="Admin Console",
-        subtitle=f"Logged in as {admin}. Manage department FAQs, complaints, and logs.",
-        badge_text="Admin"
-    )
+    top_hero("Admin Console", "Manage FAQs, complaints, and chat logs. Keep answers official + consistent.")
+    nav_bar("admin")
 
-    tabs = st.tabs([
-        "➕ Add Dept FAQ",
-        "🛠️ Manage FAQs",
-        "📥 Complaint Queue",
-        "📊 Chat Logs"
-    ])
+    tabs = st.tabs(["➕ Add FAQ", "🛠️ Manage FAQs", "📥 Complaints", "📊 Chat Logs"])
 
     with tabs[0]:
-        st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-        st.markdown("### Create a new FAQ")
+        st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
         dept = st.selectbox("Department", DEPARTMENTS)
-        q = st.text_area("Customer Question", placeholder="e.g., How do I reset my PIN?")
-        a = st.text_area("Official Answer", placeholder="Provide the official guidance…")
-        tags = st.text_input("Tags / Keywords (comma separated)", placeholder="pin, reset, password")
-        save = st.button("Save FAQ")
+        q = st.text_area("Customer Question")
+        a = st.text_area("Official Answer")
+        tags = st.text_input("Tags (comma separated)")
+        st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
+        save = st.button("Save FAQ", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if save:
             if q.strip() and a.strip():
-                add_custom_faq(dept, q.strip(), a.strip(), tags.strip(), admin)
+                add_custom_faq(dept, q.strip(), a.strip(), tags.strip(), st.session_state.user)
                 st.success("FAQ added."); st.rerun()
             else:
-                st.error("Question and Answer are required.")
+                st.error("Question and answer are required.")
 
     with tabs[1]:
         filter_dept = st.selectbox("Filter by Department", ["ALL"] + DEPARTMENTS)
         df = fetch_custom_faqs(filter_dept)
-
         if df.empty:
             st.info("No custom FAQs yet.")
         else:
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown("### Existing FAQs")
             st.dataframe(df[["id","department","question","answer","tags","updated_at"]], use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown("### Edit / Delete FAQ")
-            edit_id = st.selectbox("Select FAQ ID", df["id"].tolist())
+            st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+            edit_id = st.selectbox("Select FAQ ID to edit/delete", df["id"].tolist())
             row = df[df["id"] == edit_id].iloc[0]
 
-            new_dept = st.selectbox(
-                "Department",
-                DEPARTMENTS,
-                index=safe_index(DEPARTMENTS, row.get("department"), fallback_value="CONTACT")
-            )
+            new_dept = st.selectbox("Department", DEPARTMENTS,
+                                    index=DEPARTMENTS.index(row["department"]) if row["department"] in DEPARTMENTS else 0)
             new_q = st.text_area("Question", value=row["question"])
             new_a = st.text_area("Answer", value=row["answer"])
             new_tags = st.text_input("Tags", value=row.get("tags","") or "")
 
-            colE, colD = st.columns(2)
-            with colE:
-                if st.button("Update FAQ"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
+                if st.button("Update FAQ", use_container_width=True):
                     update_custom_faq(edit_id, new_dept, new_q.strip(), new_a.strip(), new_tags.strip())
-                    st.success("FAQ updated."); st.rerun()
-            with colD:
-                if st.button("Delete FAQ"):
+                    st.success("Updated."); st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+            with c2:
+                if st.button("Delete FAQ", use_container_width=True):
                     delete_custom_faq(edit_id)
-                    st.warning("FAQ deleted."); st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
+                    st.warning("Deleted."); st.rerun()
 
     with tabs[2]:
         STATUS_OPTS = ["Open", "In Review", "Resolved", "Rejected"]
@@ -1340,72 +1152,115 @@ def admin_page():
 
         colA, colB = st.columns(2)
         with colA:
-            dept_filter = st.selectbox("Department Queue", ["ALL"] + DEPARTMENTS)
+            dept_filter = st.selectbox("Department", ["ALL"] + DEPARTMENTS)
         with colB:
             status_filter = st.selectbox("Status", ["ALL"] + STATUS_OPTS)
 
         comp_df = fetch_complaints(dept_filter, status_filter)
-
         if comp_df.empty:
             st.info("No complaints found.")
         else:
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown("### Complaint Queue")
-            st.dataframe(
-                comp_df[["id","username","department","priority","status","summary","created_at"]],
-                use_container_width=True
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+            st.dataframe(comp_df[["id","username","department","priority","status","summary","created_at"]],
+                         use_container_width=True)
 
-            cid = st.selectbox("Open Complaint Ticket", comp_df["id"].tolist())
+            cid = st.selectbox("Open Ticket", comp_df["id"].tolist())
             row = comp_df[comp_df["id"] == cid].iloc[0]
 
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown(f"### Ticket #{cid}")
-            st.write(f"**Customer:** {row['username']}")
-            st.write(f"**Department:** {row['department']} — {DEPT_LABELS.get(row['department'], row['department'])}")
-            st.write(f"**Priority:** {row['priority']}")
-            st.write(f"**Status:** {row['status']}")
-            st.write("**Complaint Text:**")
+            st.markdown("### Ticket Details")
+            st.write(f"Customer: {row['username']}")
+            st.write(f"Department: {row['department']} — {DEPT_LABELS.get(row['department'], row['department'])}")
+            st.write(f"Priority: {row['priority']} | Status: {row['status']}")
             st.write(row["text"])
-            st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown("### Update Ticket")
-            new_status = st.selectbox(
-                "Status",
-                STATUS_OPTS,
-                index=safe_index(STATUS_OPTS, row.get("status"), fallback_value="Open")
-            )
-            new_priority = st.selectbox(
-                "Priority",
-                PRIORITY_OPTS,
-                index=safe_index(PRIORITY_OPTS, row.get("priority"), fallback_value="Normal")
-            )
+            new_status = st.selectbox("Update Status", STATUS_OPTS,
+                                      index=STATUS_OPTS.index(row["status"]) if row["status"] in STATUS_OPTS else 0)
+            new_priority = st.selectbox("Update Priority", PRIORITY_OPTS,
+                                        index=PRIORITY_OPTS.index(row["priority"]) if row["priority"] in PRIORITY_OPTS else 0)
             notes = st.text_area("Internal Notes", value=row.get("internal_notes") or "", height=120)
 
-            if st.button("Save Updates"):
+            st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
+            if st.button("Save Updates", use_container_width=True):
                 update_complaint(cid, status=new_status, priority=new_priority, internal_notes=notes)
-                st.success("Complaint updated."); st.rerun()
+                st.success("Saved."); st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
     with tabs[3]:
         conn = get_conn()
         logs = pd.read_sql_query("SELECT * FROM chat_logs ORDER BY created_at DESC LIMIT 800", conn)
         conn.close()
-
         if logs.empty:
             st.info("No chats yet.")
         else:
-            st.markdown("<div class='bank-card'>", unsafe_allow_html=True)
-            st.markdown("### Chat Logs")
             st.dataframe(logs, use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
 
-    if st.button("Logout"):
-        for k in ["user","role","page","messages","active_ticket","preferred_lang"]:
-            st.session_state.pop(k, None)
-        st.rerun()
+
+# ----------------------------
+# CHAT DRAWER WIDGET (retractable chatbot)
+# ----------------------------
+def chat_drawer_widget(expanded_default: bool = False):
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "preferred_lang" not in st.session_state:
+        st.session_state.preferred_lang = None
+
+    # Seed welcome once
+    if len(st.session_state.messages) == 0:
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "Hi — I’m Baraka. Ask about loans, accounts, ATM issues, transfers, fees. I won’t ask for PINs/OTPs."}
+        )
+
+    with st.expander("💬 Baraka Chat (open / close)", expanded=expanded_default):
+        st.markdown('<div class="chat-drawer-hint">Tip: say “reply in Kiswahili / Amharic / Somali / Arabic / Shona / Kikuyu / Dholuo / Kamba / Kisii / Meru”.</div>', unsafe_allow_html=True)
+
+        # Show messages using Streamlit chat (looks like a real chatbot)
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                st.write(m["content"])
+
+        # Input row
+        with st.form("chat_send", clear_on_submit=True):
+            q = st.text_input("Message Baraka…", placeholder="e.g., nataka kuchukua mkopo")
+            col1, col2 = st.columns([1, 1])
+            send = col1.form_submit_button("Send")
+            clear = col2.form_submit_button("Clear chat")
+
+        if clear:
+            st.session_state.messages = [{"role": "assistant", "content": "Hi — I’m Baraka. How can I help today?"}]
+            st.rerun()
+
+        if send and q.strip():
+            user = st.session_state.get("user", "guest")
+            st.session_state.messages.append({"role": "user", "content": q.strip()})
+
+            # Language command?
+            handled, msg, forced = handle_language_command(q.strip())
+            if handled:
+                st.session_state.preferred_lang = forced
+                st.session_state.messages.append({"role": "assistant", "content": msg})
+                st.rerun()
+
+            if not OPENAI_API_KEY:
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": "OPENAI_API_KEY is not set. Please set it to enable translation + multilingual replies."
+                })
+                st.rerun()
+
+            # Detect language and translate to English for routing/retrieval
+            detected_lang, q_en = detect_and_translate_to_english(q.strip())
+            out_lang = st.session_state.get("preferred_lang") or detected_lang
+
+            dept, dscore, dmethod = route_department(q_en)
+            ans, source, score = generate_reply(q.strip(), q_en, user, dept, out_lang)
+
+            footer_en = f"Dept: {dept} ({DEPT_LABELS.get(dept)}) • Routing: {dscore:.2f} ({dmethod}) • Source: {source}"
+            footer = translate_from_english(footer_en, out_lang)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"{ans}\n\n— {footer}"
+            })
+            st.rerun()
 
 
 # ----------------------------
@@ -1417,24 +1272,27 @@ def main():
 
     if "page" not in st.session_state:
         st.session_state.page = "login"
-    if "preferred_lang" not in st.session_state:
-        st.session_state.preferred_lang = None
 
     page = st.session_state.page
     role = st.session_state.get("role")
 
     if page == "login":
         login_page()
+        return
+
+    if role == "admin":
+        st.session_state.page = "admin" if page != "admin" else "admin"
+        admin_page()
+        return
+
+    # user pages
+    if page == "home":
+        user_home_page()
+    elif page == "complaint":
+        complaint_page()
     else:
-        if role == "admin":
-            admin_page()
-        else:
-            if page == "home":
-                user_home_page()
-            elif page == "complaint":
-                complaint_page()
-            else:
-                chat_page()
+        chat_page()
+
 
 if __name__ == "__main__":
     main()
