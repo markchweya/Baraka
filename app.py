@@ -163,21 +163,10 @@ LIGHT_CSS = """
 
 /* Kill Streamlit "Deploy" toolbar + menu noise */
 #MainMenu, footer {visibility: hidden;}
-/* NOTE: We must NOT hide stToolbar / stHeaderActionElements, otherwise the sidebar toggle disappears.
-   (This was the reason your sidebar couldn't be opened.) */
+[data-testid="stToolbar"]{display:none !important;}
 header[data-testid="stHeader"]{background:transparent !important;}
 [data-testid="stStatusWidget"]{display:none !important;}
-
-/* --- Sidebar toggle fix (keep hamburger button available) --- */
-[data-testid="stToolbar"]{display:flex !important;}
-[data-testid="stHeaderActionElements"]{display:flex !important;}
-
-/* Also force sidebar to remain visible even if Streamlit marks it collapsed */
-section[data-testid="stSidebar"][aria-expanded="false"]{
-  transform: translateX(0%) !important;
-  margin-left: 0 !important;
-  visibility: visible !important;
-}
+[data-testid="stHeaderActionElements"]{display:none !important;}
 
 /* Global font + background */
 html, body, [data-testid="stAppViewContainer"]{
